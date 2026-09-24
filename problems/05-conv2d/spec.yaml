@@ -1,0 +1,70 @@
+id: 05-conv2d
+title: 二维卷积(valid 模式)
+difficulty: 3
+tags: [2d, convolution, stencil, shared-memory, reuse]
+concepts:
+  - 分块复用:halo(光晕)区与重复读取的代价
+  - 每次访存能喂饱多少个 FMA(算术强度 / 数据复用)
+  - 共享内存 + 寄存器分块:一个线程算多个输出
+  - 动态共享内存与运行时的卷积核尺寸
+statement: problem.md
+
+# image 是 h 行 w 列(row-major);kernel 是 kh 行 kw 列;
+# out 是 oh 行 ow 列(row-major),其中 oh = h-kh+1, ow = w-kw+1(valid 卷积,不补零)。
+# oh/ow 单独作为参数传入,是因为 spec 的 shape 只能写成参数的乘积,
+# 表达不了 h-kh+1 —— 这一点与 cuDNN 显式收 dims 的做法一致。
+buffers:
+  - {name: image,  dtype: f32, shape: [h, w],   role: in}
+  - {name: kernel, dtype: f32, shape: [kh, kw], role: in}
+  - {name: out,    dtype: f32, shape: [oh, ow], role: out}
+params:
+  - {name: h,  dtype: i32}
+  - {name: w,  dtype: i32}
+  - {name: kh, dtype: i32}
+  - {name: kw, dtype: i32}
+  - {name: oh, dtype: i32}
+  - {name: ow, dtype: i32}
+
+entry:
+  kernel: conv2d
+  launcher: conv2d_launch
+
+cases:
+  # 4096² × 4B = 64MiB 读 + 4090² × 4B = 64MiB 写 ≈ 134MB 访存,
+  # 4090 上 DRAM 下限约 133µs —— 基线远达不到(341µs),这里就是优化空间所在。
+  - {name: k7,  params: {h: 4096, w: 4096, kh: 7, kw: 7, oh: 4090, ow: 4090}}
+  # 同样的图,3×3 核:复用度低,基线已经贴近 DRAM 下限 ——
+  # 这个用例是「照镜子」用的,它告诉你分块不是万能药(不参与拉高评级,见题面)。
+  - {name: k3,  params: {h: 4096, w: 4096, kh: 3, kw: 3, oh: 4094, ow: 4094}}
+  # 非 2 的幂 + 质数宽(3079 是质数)+ 非方形核(kh≠kw),考边界与 halo 处理
+  - {name: ragged, params: {h: 2053, w: 3079, kh: 5, kw: 9, oh: 2049, ow: 3071}}
+  # 比一个 tile 还小:考「网格不足一块」以及 oh/ow 不整除 tile 的边界
+  - {name: tiny, params: {h: 37, w: 53, kh: 7, kw: 5, oh: 31, ow: 49}}
+
+verify:
+  # 49~81 项 f32 累加,换一种求和顺序与 double 参考值的偏差可达 ~1e-5 量级,
+  # 所以 atol 取 1e-4(正确实现有 ~100 倍余量;而错误实现的偏差是 O(1),抓得住)。
+  atol: 1e-4
+  rtol: 1e-4
+  repeat: 3
+
+perf:
+  # 基线被「重复读」卡住:LSU/L1 的访存流水线被 49 倍冗余的采样点读吃满,
+  # 显存带宽只用上 ~39%(341µs / 134MB ≈ 393 GB/s)。优化解把重复读去掉之后
+  # 就撞上显存带宽墙,所以用相对基线的加速比评级,而不是带宽占峰值百分比。
+  bound: compute
+  metric: speedup
+  repeat: 50
+  warmup: 10
+  # 门槛由实测倒推(2026-09-25,4090):
+  #   k7 基线 341µs;结构完整的解(分块 + 寄存器分块)实测 119~123µs = 2.8~2.9x,
+  #   有效流量 134MB/119µs ≈ 1.1 TB/s —— 已经就是这张卡的显存带宽墙
+  #   (标称 1008 GB/s,超出的部分是最后一批写还没落盘)。
+  #   所以 4x 以上在本用例上物理不可达,S 就定在「贴墙」的 2.9x。
+  #   k3 用例基线 127µs 本身已跑满带宽(≈1.05 TB/s),只有 ~1.2x 空间 —— 见题面。
+  # 参考区间:纯共享内存分块不做寄存器分块约 1.5~2x,基线本身 1.0x。
+  grades: {B: 1.5, A: 2.3, S: 2.9}
+
+sanitize:
+  memcheck: true
+  racecheck_case: tiny

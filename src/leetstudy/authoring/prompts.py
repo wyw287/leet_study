@@ -1,0 +1,273 @@
+"""出题与讲评的提示词模板。
+
+这里最关键的是把「框架的物理约束」讲清楚 —— 出题最容易犯的错不是代码写错,
+而是设计出一批**没法评级**的题(用例太小、门槛物理上不可达),或者**测试太弱**的题。
+下面每一条约束都对应一次真实的踩坑。
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List
+
+SPEC_SCHEMA = r"""
+## spec.yaml 完整字段说明
+
+```yaml
+id: <目录名,必须与目录名完全一致,如 05-conv2d>
+title: <中文标题>
+difficulty: 1..5
+tags: [<英文标签>]
+concepts: [<中文考点,写给学习者看>]
+statement: problem.md
+
+# ---- 接口契约:决定 LaunchCtx / RefCtx 的字段 ----
+buffers:
+  - name: <C 标识符>
+    dtype: f32 | f64 | i32 | i64 | u32 | u8
+    shape: [<参数名或整数字面量,可多项表示多维>]   # 空列表 [] 表示标量
+    role: in | out | scratch
+    fill: uniform | positive | randint | zero      # 仅 role=in 有效
+    #   uniform  → [-1, 1)
+    #   positive → (0, 1]   给 log / 开方 / 除法等定义域为正的题用
+    #   randint  → 0..99 的整数(浮点类型则转成浮点)
+    #   zero     → 全 0
+params:
+  - {name: <C 标识符>, dtype: i32 | ...}
+    # 标量参数。会同时作为字段出现在 LaunchCtx 和 RefCtx 里。
+    # 形状表达式里可以引用它们。
+
+entry:
+  kernel: <__global__ 函数名>
+  launcher: <host 端启动函数名,形如 void launcher(LaunchCtx& ctx)>
+
+cases:
+  - {name: <用例名>, params: {<每个参数都给一个取值>}}
+    # 参数取值必须是正整数(框架用它算缓冲大小)
+
+verify:
+  atol: 1e-5      # 过宽的容差会让错误实现轻松通过,框架会拒绝 atol>1.0 / rtol>0.1
+  rtol: 1e-4
+  repeat: 3       # 每个用例重复跑几次。>1 用于捕捉竞态/未初始化内存导致的「有时对有时错」
+
+perf:
+  enabled: true
+  bound: memory | compute
+  metric: bandwidth | speedup
+    #   bandwidth —— 按「有效带宽占峰值百分比」评级。**访存瓶颈题的朴素 CUDA 实现
+    #                往往就是最优算法**(比如向量加法、转置的分块版),这类题用加速比
+    #                毫无区分度,必须用带宽。
+    #   speedup   —— 按「相对基线的加速比」评级。适合朴素实现远非最优的题
+    #                (归约、矩阵乘等)。metric 不写时按 bound 推断:memory→bandwidth。
+  repeat: 50
+  warmup: 10
+  grades: {...}   # 含义随 metric 变:
+                  #   bandwidth → 占峰值百分比,如 {B: 50, A: 70, S: 85}
+                  #   speedup   → 倍数,如 {B: 3.0, A: 10.0, S: 20.0}
+  flush_l2: true  # 默认开启,不要关。4090 有 72MB L2,不清缓存测的是缓存带宽。
+
+sanitize:
+  memcheck: true
+  racecheck_case: <某个小用例的名字>
+    # racecheck 极慢,只能跑最小的用例。这个用例要小到几毫秒内能跑完。
+```
+
+## 运行环境(必须按这个来设计,否则题目会不可用)
+
+- GPU: NVIDIA RTX 4090 ×5,sm_89,**理论峰值带宽 1008 GB/s**
+- 框架自动在每次计时迭代前**清空 L2**(读一遍大于 L2 的缓冲),所以测到的是真实显存带宽
+- 计时用 cudaEvent,**分辨率约 0.5µs**。因此:
+  - **总耗时不到 20µs 的用例会被自动跳过评级**(那个量级测的是启动开销和抖动)。
+    每道题至少要有一个用例大到可评级 —— 经验值:访存型题目数据量要 ≥ 100MB
+    (如 32M 个 float = 128MB,约 130µs);计算型题目要让 kernel 跑到几百 µs。
+  - 但用例也不能太大:基线耗时超过 5 秒会让做题体验崩坏。
+- 用户**不需要写 cudaMalloc/cudaMemcpy** —— 框架负责分配与搬运,用户只拿到 device 指针。
+- 框架在每块缓冲前后各留 4096 个元素的**哨兵区**填特殊值,越界写会被立刻检测到。
+- 框架在每次校验执行前把 out 缓冲填成**毒值**(浮点 NaN、整数 0x5EED5EED),
+  所以「kernel 没写输出」会被精确识别。
+- 每个用例的实际输出会与 `reference.cpp` 的结果逐一比对。
+"""
+
+REQUIREMENTS = r"""
+## 硬性要求
+
+### reference.cpp —— 标准答案(oracle)
+- **CPU 实现**,只写 `void reference(RefCtx& ctx)`,用 `ctx.` 访问所有缓冲与参数
+- **必须完全正确**。它是判分的基准,写错了整道题就废了
+- 浮点累加请用 `double` 中间变量,保证接近真值
+- 不要用任何 CUDA API,也不要用 Scratch 缓冲(RefCtx 里没有 scratch 字段)
+
+### baseline.cu —— 性能基线(加速比的分母)
+- **必须正确**(框架会检查:基线与参考解在**所有**用例上必须一致)
+- 必须定义与 spec 中同名的 `kernel` 与 `launcher`
+- 要是**朴素、直白**的写法 —— 它是学习者要超越的对象
+- 但如果这道题是访存瓶颈、而朴素写法已经接近最优(比如向量加法),
+  那就要把 spec 的 metric 设成 `bandwidth`,并**在题面里诚实说明「这题没有优化空间,
+  它的价值是让你看到带宽天花板」** —— 不要假装有挑战
+
+### template.cu —— 给学习者的骨架
+- 只写 `#include "ctx.h"` + kernel 与 launcher 的**空壳**,里面是 TODO 注释
+- **必须不完整到无法通过测试** —— 框架会检查「空模板必须被判失败」
+- 注释要有教学价值:写清楚这道题的思路、常见陷阱、以及为什么
+
+### problem.md —— 题面
+- **中文**,面向刚学 CUDA 的人
+- 结构:题目描述 → 为什么这道题重要 → 解法思路(不要直接给完整代码)→
+  陷阱提醒 → 评分说明 → 3 个思考题
+- 解释要落到**物理原因**上(为什么慢、为什么快),不要只说「这样做性能更好」
+- 诚实:如果这题没有优化空间,就直说
+
+### cases
+- 至少一个用例大到可评级(见上文 20µs 规则)
+- **必须包含边界用例**:非 2 的幂、质数规模的参数,用来考边界处理
+- 至少一个小用例供 racecheck 使用(如果 spec 里配了 racecheck_case)
+"""
+
+WORKFLOW = r"""
+## 你该怎么做
+
+**按这个顺序做,不要跳步。** 写文件很快,而 `leet validate` 要反复编译,
+很慢 —— 先把该写的写完,再进入验证循环。这样即使中途被打断,留下的也是一道
+完整的题,而不是半成品。
+
+> **不要通读框架源码**(`src/leetstudy/` 下的文件)。出题需要的 spec 格式、
+> 检查规则、约束都已经在上面写全了,源码里没有额外信息。花时间读它只会拖慢进度。
+> 想找题面写法参考,读一道已有题目的 `problem.md` 就够了。
+
+### 第一步:想清楚(不要动笔)
+这道题的**物理瓶颈**是什么(访存 / 计算 / 并行度不足 / 同步开销)?
+这决定 metric 与 grades,写错了后面全是白费。
+
+### 第二步:一口气写完 5 个文件
+1. `spec.yaml`
+2. `reference.cpp`(CPU 参考解,必须完全正确)
+3. `baseline.cu`(朴素 CUDA 实现,必须正确且慢)
+4. `template.cu`(骨架,必须**不完整到无法通过测试**)
+5. **`problem.md`(题面)** —— 一定要在这一步写完,不要留成占位符。
+   `leet validate` 会检查题面是否有实质内容(至少 600 字符、有章节结构、
+   有「思考题」小节),占位符是过不了的。
+
+### 第三步:验证与调参
+6. 跑 `leet validate <id>`。它会做这些检查,任何一项不过都必须修:
+   - 文件齐备 / **题面有实质内容** / 编译基线 / 基线通过对拍(基线与参考解必须完全一致)
+   - 性能地板(至少一个用例大到可评级)
+   - **模板必须失败** —— 空模板要是能过,说明测试形同虚设
+   - **劣化解必须失败** —— 框架会注入「全填 0」「全填 1」「只写首元素」等必然错误的
+     实现,每一个都必须被判失败。任意一个竟然通过了,说明这道题的测试太弱。
+7. **测量真实数字,再据此定 grades**。不要凭感觉写门槛 ——
+   `leet validate` 会打印基线的实际耗时。想看优化解能拿多少分,就写一份正确的
+   优化解放进 `solutions/<id>/solution.cu`,跑 `leet test <id>`;
+   但要**先临时把耗时最久的用例改小**,测出趋势后再改回真实规模,
+   否则光是一次 test 就要等很久。
+   **门槛必须物理可达**:例如转置题基线只跑到 267 GB/s、峰值是 1008 GB/s,
+   那么理论最大加速比就是 3.8x,设 S=8x 是永远拿不到的废门槛。
+8. **定稿后必须把临时解答文件删掉**(`solutions/<id>/` 整个删掉),
+   不要留答案在学习者的工作区里。
+
+### 最后
+用一句话汇报:题目 id、考点、指标与门槛、实测数字。
+"""
+
+REVIEW_PROMPT = r"""你是一位 CUDA 教学助手。下面是一个学习者对某道刷题题的解答,以及框架给出的
+判题数据。请给出**针对这份代码**的讲评。
+
+要求:
+1. 先判断他卡在哪一层的认知上(索引?访存模式?同步?并行度?数值?)
+2. 指出**具体行**的问题,不要泛泛而谈
+3. 解释物理原因,不要只说「建议这样做」
+4. 给出下一步**具体可执行**的优化方向,并说明预期能提升多少、为什么
+5. 如果他已经做得很好,就说清楚好在哪、以及还有什么边界可以推
+6. 用中文,直接给结论,不要客套
+
+不要重写他的代码给他抄 —— 指出方向和原因,让他自己改。
+"""
+
+
+def build_author_prompt(requirement: str, root: Path, example_id: str = "01-vector-add",
+                        existing_ids: List[str] = None) -> str:
+    """组装出题用的完整提示词。
+
+    直接把题库里一道已通过验证的题完整读进来当范例 —— 这样提示词与真实的
+    spec 格式永远同步,不会因为文档漂移而生成出格式过时的题目。
+    """
+    example_dir = root / "problems" / example_id
+    example_text = ""
+    for fname in ("spec.yaml", "reference.cpp", "baseline.cu", "template.cu"):
+        f = example_dir / fname
+        if f.is_file():
+            example_text += f"\n### {fname}\n```\n{f.read_text(encoding='utf-8')}\n```\n"
+
+    existing = ""
+    if existing_ids:
+        existing = (
+            "\n## 已有题目(不要重复出这些;新题要与之互补)\n"
+            + "\n".join(f"  - {i}" for i in existing_ids)
+            + "\n"
+        )
+
+    return f"""你是一位 CUDA 教学专家,正在为一个「LeetCode 式的 CUDA 刷题框架」出题。
+
+# 学习者的需求
+
+{requirement}
+{existing}
+# 你要产出什么
+
+在 `problems/<新题id>/` 目录下产出 5 个文件:spec.yaml / problem.md / template.cu /
+reference.cpp / baseline.cu。id 用小写短横线风格并带序号前缀,如 `05-conv2d`。
+
+{SPEC_SCHEMA}
+{REQUIREMENTS}
+{WORKFLOW}
+
+# 完整范例(已通过全部校验,请严格对照它的格式与注释风格)
+
+```{example_text}```
+
+# 开始
+
+记住三个最容易出错的地方:
+1. **用例太小** → 性能评分完全落空(必须有一个用例大到可评级)
+2. **门槛物理不可达** → 评级形同虚设(先测量再定门槛)
+3. **模板能通过测试** → 这道题没有意义(空模板必须失败)
+
+现在开始。完成后运行 `leet validate <id>` 确认全部通过。
+"""
+
+
+def build_review_prompt(problem_id: str, title: str, statement: str, solution_src: str,
+                        spec_yaml: str, baseline_src: str, verdict_summary: str) -> str:
+    """组装讲评用的提示词。"""
+    return f"""{REVIEW_PROMPT}
+
+# 题目
+
+{problem_id} {title}
+
+## 题面
+
+{statement}
+
+## 题目规格(spec.yaml)
+
+```yaml
+{spec_yaml}
+```
+
+## 性能基线(学习者要超越的实现)
+
+```cuda
+{baseline_src}
+```
+
+# 学习者的解答
+
+```cuda
+{solution_src}
+```
+
+# 框架给出的判题数据
+
+{verdict_summary}
+
+# 请开始讲评
+"""

@@ -1,0 +1,50 @@
+id: 03-matrix-transpose
+title: 矩阵转置
+difficulty: 2
+tags: [2d, shared-memory, memory-bound]
+concepts:
+  - 二维线程索引
+  - 内存合并访问与跨步访问的代价
+  - 共享内存分块(shared memory tiling)
+  - bank conflict
+statement: problem.md
+
+# in 是 m 行 n 列(row-major),out 是 n 行 m 列
+buffers:
+  - {name: input,  dtype: f32, shape: [m, n], role: in}
+  - {name: output, dtype: f32, shape: [n, m], role: out}
+params:
+  - {name: m, dtype: i32}
+  - {name: n, dtype: i32}
+
+entry:
+  kernel: transpose
+  launcher: transpose_launch
+
+cases:
+  # 4096² × 4B = 64MB 读 + 64MB 写 = 128MB 访存,4090 上约 130µs
+  - {name: square,  params: {m: 4096, n: 4096}}
+  # 非方阵 + 质数规模,考边界与分块处理
+  - {name: rect,    params: {m: 4093, n: 2047}}
+  # 比一个线程块还小,考「网格不足一块」的边界
+  - {name: tiny,    params: {m: 13, n: 7}}
+
+verify:
+  atol: 1e-5
+  rtol: 1e-4
+  repeat: 3
+
+perf:
+  bound: memory
+  metric: speedup
+  repeat: 50
+  warmup: 10
+  # 门槛按物理上限倒推:基线不合并写,只跑到 ~267 GB/s,而 4090 峰值是
+  # 1008 GB/s —— 所以理论最大加速比约 3.8x。设 S=3.5x 意味着"必须逼近峰值
+  # 带宽才拿得到",B=2.0x 是"确实用上了合并写"的水平。
+  # (小用例由框架自动跳过评级:规模不够时测的是开销而非 kernel 性能)
+  grades: {B: 2.0, A: 3.0, S: 3.5}
+
+sanitize:
+  memcheck: true
+  racecheck_case: tiny

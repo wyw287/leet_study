@@ -1,0 +1,21 @@
+# 编译产物
+build/
+*.o
+*.exe
+
+# 虚拟环境
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 题目缓存(参考输出等)
+problems/*/.cache/

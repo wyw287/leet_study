@@ -1,0 +1,47 @@
+id: 04-reduction-sum
+title: 归约求和
+difficulty: 3
+tags: [reduction, shared-memory, warp-shuffle]
+concepts:
+  - 树形归约
+  - __syncthreads 与竞态
+  - warp shuffle(避免共享内存往返)
+  - 多线程块两级归约
+statement: problem.md
+
+# 输入是 n 个 float,输出是**一个** float(shape 为空表示标量)
+buffers:
+  - {name: input,  dtype: f32, shape: [n], role: in}
+  - {name: output, dtype: f32, shape: [],  role: out}
+params:
+  - {name: n, dtype: i32}
+
+entry:
+  kernel: reduce_sum
+  launcher: reduce_sum_launch
+
+cases:
+  # 归约非常快(只读不写),所以想让耗时超过「可评级」下限(20µs),
+  # 用例规模必须给足:32M 个 float 是 128MB 读,4090 上约 128µs。
+  - {name: tiny, params: {n: 262144}}        # 25 万,竞态检查用(也考小规模)
+  - {name: big,  params: {n: 33554432}}      # 2^25,大用例
+  - {name: odd,  params: {n: 25000001}}      # 非 2 的幂,考边界
+
+# 归约的求和顺序与参考解(CPU 顺序累加)不同,浮点结果必然有微小差异。
+# 参考解用 double 累加以保证接近真值,这里给 float32 树形归约留足余量。
+verify:
+  atol: 1e-2
+  rtol: 1e-4
+  repeat: 5          # 多跑几次 —— 漏同步的归约往往「有时对有时错」
+
+perf:
+  bound: memory
+  metric: speedup
+  repeat: 50
+  warmup: 10
+  # 基线只用一个线程块,大量 SM 闲置;多块 + warp shuffle 能拿到一个数量级
+  grades: {B: 3.0, A: 10.0, S: 20.0}
+
+sanitize:
+  memcheck: true
+  racecheck_case: tiny

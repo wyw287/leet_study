@@ -1,0 +1,43 @@
+id: 01-vector-add
+title: 向量加法
+difficulty: 1
+tags: [elementwise, memory-bound]
+concepts:
+  - 线程索引与边界判断
+  - 启动配置(grid / block)
+  - 内存合并访问 coalescing
+statement: problem.md
+
+buffers:
+  - {name: a, dtype: f32, shape: [n], role: in}
+  - {name: b, dtype: f32, shape: [n], role: in}
+  - {name: c, dtype: f32, shape: [n], role: out}
+params:
+  - {name: n, dtype: i32}
+
+entry:
+  kernel: vecadd
+  launcher: vecadd_launch
+
+cases:
+  # 用例规模要足够大,让计时误差可忽略:cudaEvent 分辨率约 0.5µs,
+  # kernel 至少要跑到上百 µs,否则测的是计时器抖动而不是 kernel。
+  # 16M 元素 → 约 200MB 访存 → 4090 上约 200µs。
+  - {name: exact,  params: {n: 16777216}}     # 2^24,整除任何 2 的幂块大小
+  - {name: ragged, params: {n: 16777259}}     # 质数级,考边界处理
+
+verify:
+  atol: 1e-5
+  rtol: 1e-4
+  repeat: 3
+
+perf:
+  bound: memory
+  metric: bandwidth          # 访存瓶颈:朴素实现即最优算法,加速比无区分度
+  repeat: 50
+  warmup: 10
+  grades: {B: 50, A: 70, S: 85}   # 占峰值带宽百分比
+
+sanitize:
+  memcheck: true
+  racecheck_case: exact

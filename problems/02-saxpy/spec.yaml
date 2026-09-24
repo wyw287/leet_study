@@ -1,0 +1,44 @@
+id: 02-saxpy
+title: SAXPY
+difficulty: 1
+tags: [elementwise, memory-bound, scalar-param]
+concepts:
+  - 标量参数如何传给 kernel
+  - 一次读两个数组、写一个数组的访存模式
+  - 数据复用(这里没有 —— 所以才受限于带宽)
+statement: problem.md
+
+buffers:
+  - {name: x, dtype: f32, shape: [n], role: in}
+  - {name: y, dtype: f32, shape: [n], role: in}
+  - {name: out, dtype: f32, shape: [n], role: out}
+params:
+  - {name: alpha, dtype: f32}
+  - {name: n, dtype: i32}
+
+entry:
+  kernel: saxpy
+  launcher: saxpy_launch
+
+cases:
+  # 用例要大到耗时超过 20µs 才可评级:12 字节/元素的访存,
+  # 16M 元素 ≈ 200MB → 4090 上约 200µs
+  - {name: exact, params: {alpha: 2, n: 16777216}}
+  - {name: ragged, params: {alpha: 3, n: 16777259}}   # 质数规模,考边界
+
+verify:
+  atol: 1e-5
+  rtol: 1e-4
+  repeat: 3
+
+perf:
+  bound: memory
+  # 与向量加法同理:朴素实现即最优,加速比没有区分度,看带宽利用率
+  metric: bandwidth
+  repeat: 50
+  warmup: 10
+  grades: {B: 50, A: 70, S: 85}
+
+sanitize:
+  memcheck: true
+  racecheck_case: exact

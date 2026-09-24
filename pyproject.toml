@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "leetstudy"
+version = "0.1.0"
+description = "LeetCode 式的 CUDA 刷题框架:只写 kernel,回车即得对错、加速比与越界/竞态诊断"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.0",
+    "pyyaml>=5.4",
+    "rich>=12.0",
+]
+
+[project.scripts]
+leet = "leetstudy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

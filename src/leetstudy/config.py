@@ -1,0 +1,406 @@
+"""配置与环境探测(nvcc / GPU / claude)。
+
+本机是共享服务器(5×4090,256 核),因此:
+  * 默认环境是他人目录下的 anaconda,不得写入 —— 本框架一律用项目内 .venv
+  * GPU 需要自动挑选空闲的那张,避免和别人打架
+  * claude 是本机自定义模型接入,不能硬编码 --model
+"""
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import yaml
+
+# 配置文件位置(相对仓库根)与环境变量前缀
+CONFIG_FILENAME = "config.yaml"
+ENV_PREFIX = "LEETSTUDY_"
+
+
+def find_root(start: Optional[Path] = None) -> Path:
+    """向上查找仓库根(含 pyproject.toml 且 name = leetstudy)。"""
+    env_root = os.environ.get(ENV_PREFIX + "ROOT")
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+
+    cur = (start or Path.cwd()).resolve()
+    for candidate in [cur, *cur.parents]:
+        pyproject = candidate / "pyproject.toml"
+        if pyproject.is_file():
+            try:
+                text = pyproject.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if "leetstudy" in text:
+                return candidate
+    # 兜底:调用方所在位置(源码树)
+    return Path(__file__).resolve().parents[2]
+
+
+def _run(cmd: List[str], timeout: int = 20) -> Tuple[int, str]:
+    """跑一个探测命令,返回 (returncode, stdout+stderr)。绝不抛异常。"""
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            text=True,
+        )
+        return proc.returncode, proc.stdout or ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 127, f"{type(exc).__name__}: {exc}"
+
+
+# --------------------------------------------------------------------------- #
+# GPU
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class GpuInfo:
+    index: int
+    name: str
+    compute_cap: str
+    mem_used_mib: int
+    mem_total_mib: int
+    util_pct: int
+
+    @property
+    def free_mib(self) -> int:
+        return max(0, self.mem_total_mib - self.mem_used_mib)
+
+    def __str__(self) -> str:
+        return (
+            f"GPU {self.index}  {self.name}  sm_{self.compute_cap.replace('.', '')}  "
+            f"显存 {self.mem_used_mib}/{self.mem_total_mib} MiB  利用率 {self.util_pct}%"
+        )
+
+
+def list_gpus() -> List[GpuInfo]:
+    """枚举物理 GPU。nvidia-smi 不可用时返回空列表。"""
+    code, out = _run([
+        "nvidia-smi",
+        "--query-gpu=index,name,compute_cap,memory.used,memory.total,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ])
+    if code != 0:
+        return []
+
+    gpus: List[GpuInfo] = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 6:
+            continue
+        try:
+            gpus.append(GpuInfo(
+                index=int(parts[0]),
+                name=parts[1],
+                compute_cap=parts[2],
+                mem_used_mib=int(parts[3]),
+                mem_total_mib=int(parts[4]),
+                util_pct=int(parts[5]),
+            ))
+        except ValueError:
+            continue
+    return gpus
+
+
+def pick_gpu(explicit: Optional[int] = None) -> Optional[int]:
+    """挑一张空闲 GPU。
+
+    优先级:显式指定 > CUDA_VISIBLE_DEVICES > 按 (利用率, 已用显存) 升序挑最闲的。
+    返回物理 GPU 序号;None 表示交给驱动默认(不设 CUDA_VISIBLE_DEVICES)。
+    """
+    if explicit is not None:
+        return explicit
+    if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
+        return None  # 用户已经安排好可见性,别覆盖
+
+    gpus = list_gpus()
+    if not gpus:
+        return None
+    best = min(gpus, key=lambda g: (g.util_pct, g.mem_used_mib))
+    # 唯一一张卡时也别费事
+    return best.index if len(gpus) > 1 else None
+
+
+# --------------------------------------------------------------------------- #
+# 编译
+# --------------------------------------------------------------------------- #
+
+def detect_arch() -> str:
+    """探测目标架构,如 sm_89。用于 nvcc -arch。"""
+    gpus = list_gpus()
+    if gpus:
+        cap = gpus[0].compute_cap.replace(".", "")
+        if re.match(r"^\d+$", cap):
+            return f"sm_{cap}"
+
+    # 退路:取 nvcc 支持的最高架构
+    nvcc = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    code, out = _run([nvcc, "--list-gpu-arch"])
+    if code == 0:
+        archs = re.findall(r"compute_(\d+)", out)
+        if archs:
+            return f"sm_{max(archs, key=int)}"
+    return "sm_75"
+
+
+# 常见 GPU 的标称峰值带宽(GB/s),用于把实测 GB/s 换算成「占峰值百分比」。
+# 仅作评分参照。实测值可能略高于标称 —— 因为 cudaEvent 停止计时的瞬间,
+# 最后一批写还在 L2 里没落盘,少算了这部分显存流量。
+PEAK_BANDWIDTH_GBPS: dict = {
+    "RTX 5090": 1792.0,
+    "RTX 4090": 1008.0,
+    "RTX 4080": 717.0,
+    "RTX 3090": 936.0,
+    "RTX 3080": 760.0,
+    "A100-SXM4-40GB": 1555.0,
+    "A100-SXM4-80GB": 2039.0,
+    "A100-PCIE": 1555.0,
+    "H100-SXM5": 3350.0,
+    "H100-PCIE": 2039.0,
+    "L40S": 864.0,
+    "V100-SXM2": 900.0,
+    "V100-PCIE": 898.0,
+    "T4": 320.0,
+    "A10": 600.0,
+}
+
+
+def lookup_peak_bandwidth(gpu_name: str) -> Optional[float]:
+    """按 GPU 名称查标称峰值带宽。名称取最长匹配,避免 V100-SXM2 命中 V100-PCIE。"""
+    best: Optional[tuple] = None
+    for key, value in PEAK_BANDWIDTH_GBPS.items():
+        if key.lower() in gpu_name.lower():
+            if best is None or len(key) > best[0]:
+                best = (len(key), value)
+    return best[1] if best else None
+
+
+# --------------------------------------------------------------------------- #
+# 配置
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Config:
+    root: Path
+    nvcc: str = "nvcc"
+    sanitizer: str = "compute-sanitizer"
+    claude_bin: str = "claude"
+    arch: str = "sm_89"
+    gpu: Optional[int] = None            # 显式指定的物理 GPU
+    claude_model: Optional[str] = None   # None = 继承用户默认(本机是自定义模型)
+    claude_extra_args: List[str] = field(default_factory=list)
+    compile_timeout: int = 180
+    run_timeout: int = 120
+    sanitizer_timeout: int = 600
+    # 单次出题的模型调用超时。出题是一个「写 → 编译 → 跑 → 改」的长循环,
+    # 往往要十几到几十分钟,默认给足。
+    author_timeout: int = 3600
+    # 显式覆盖峰值带宽(GB/s);None 表示按 GPU 名称自动查表
+    peak_bw_override: Optional[float] = None
+    # 出题/讲评时放给 claude 的工具白名单(None = 用 agent 模块的默认值)
+    claude_allowed_tools: Optional[List[str]] = None
+
+    def resolve_peak_bandwidth(self) -> Optional[float]:
+        """本题所在的 GPU 的标称峰值带宽。查不到返回 None(此时不显示占比)。"""
+        if self.peak_bw_override:
+            return self.peak_bw_override
+        gpus = list_gpus()
+        if not gpus:
+            return None
+        return lookup_peak_bandwidth(gpus[0].name)
+
+    @property
+    def problems_dir(self) -> Path:
+        return self.root / "problems"
+
+    @property
+    def solutions_dir(self) -> Path:
+        return self.root / "solutions"
+
+    @property
+    def build_dir(self) -> Path:
+        return self.root / "build"
+
+    def build_dir_for(self, problem_id: str) -> Path:
+        return self.build_dir / problem_id
+
+    def env_for_gpu(self, gpu: Optional[int]) -> dict:
+        """返回设置了 CUDA_VISIBLE_DEVICES 的环境变量副本。"""
+        env = dict(os.environ)
+        chosen = self.gpu if gpu is None else gpu
+        if chosen is None:
+            chosen = pick_gpu(None)
+        if chosen is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(chosen)
+        return env
+
+    def resolve_gpu(self, override: Optional[int]) -> Optional[int]:
+        return pick_gpu(self.gpu if override is None else override)
+
+
+def load_config(root: Optional[Path] = None) -> Config:
+    """加载配置:config.yaml < 环境变量 < 调用方覆盖。"""
+    # 一律转绝对路径 —— 编译器/子进程的 cwd 未必是当前目录
+    root = (root or find_root()).expanduser().resolve()
+    cfg = Config(root=root)
+
+    cfg_path = root / CONFIG_FILENAME
+    raw: dict = {}
+    if cfg_path.is_file():
+        try:
+            loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                raw = loaded
+        except yaml.YAMLError:
+            raw = {}
+
+    def env(key: str) -> Optional[str]:
+        return os.environ.get(ENV_PREFIX + key)
+
+    cfg.nvcc = env("NVCC") or str(raw.get("nvcc") or cfg.nvcc)
+    cfg.sanitizer = env("SANITIZER") or str(raw.get("sanitizer") or cfg.sanitizer)
+    cfg.claude_bin = env("CLAUDE_BIN") or str(raw.get("claude_bin") or cfg.claude_bin)
+    cfg.arch = env("ARCH") or str(raw.get("arch") or "") or detect_arch()
+    cfg.claude_model = env("CLAUDE_MODEL") or raw.get("claude_model") or None
+
+    # 路径类设置:相对路径按仓库根解析
+    for attr in ("nvcc", "sanitizer", "claude_bin"):
+        value = getattr(cfg, attr)
+        if "/" in value:
+            p = Path(value).expanduser()
+            if not p.is_absolute():
+                p = root / p
+            setattr(cfg, attr, str(p))
+
+    raw_extra = raw.get("claude_extra_args") or []
+    if isinstance(raw_extra, list):
+        cfg.claude_extra_args = [str(a) for a in raw_extra]
+
+    raw_tools = raw.get("claude_allowed_tools")
+    if isinstance(raw_tools, list):
+        cfg.claude_allowed_tools = [str(t) for t in raw_tools]
+
+    if raw.get("gpu") is not None:
+        try:
+            cfg.gpu = int(raw["gpu"])
+        except (TypeError, ValueError):
+            cfg.gpu = None
+    if env("GPU"):
+        try:
+            cfg.gpu = int(env("GPU"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            pass
+
+    for attr, default in (
+        ("compile_timeout", cfg.compile_timeout),
+        ("run_timeout", cfg.run_timeout),
+        ("sanitizer_timeout", cfg.sanitizer_timeout),
+        ("author_timeout", cfg.author_timeout),
+    ):
+        value = env(attr.upper()) or raw.get(attr)
+        try:
+            setattr(cfg, attr, int(value))
+        except (TypeError, ValueError):
+            setattr(cfg, attr, default)
+
+    peak = env("PEAK_BANDWIDTH_GBPS") or raw.get("peak_bandwidth_gbps")
+    try:
+        cfg.peak_bw_override = float(peak) if peak else None
+    except (TypeError, ValueError):
+        cfg.peak_bw_override = None
+
+    return cfg
+
+
+# --------------------------------------------------------------------------- #
+# 环境自检(leet doctor 用)
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Check:
+    name: str
+    ok: bool
+    detail: str
+    hint: str = ""
+
+
+def doctor(cfg: Config) -> List[Check]:
+    checks: List[Check] = []
+
+    # nvcc
+    nvcc_path = shutil.which(cfg.nvcc) or (cfg.nvcc if Path(cfg.nvcc).is_file() else None)
+    if nvcc_path:
+        code, out = _run([nvcc_path, "--version"])
+        ver = ""
+        if code == 0:
+            m = re.search(r"release (\d+\.\d+)", out)
+            ver = f"release {m.group(1)}" if m else ""
+        checks.append(Check("nvcc", True, f"{nvcc_path} {ver}".strip()))
+    else:
+        checks.append(Check(
+            "nvcc", False, f"未找到 {cfg.nvcc!r}",
+            "安装 CUDA Toolkit 或设置 LEETSTUDY_NVCC=/path/to/nvcc",
+        ))
+
+    # GPU
+    gpus = list_gpus()
+    if gpus:
+        free = [g for g in gpus if g.util_pct < 10 and g.mem_used_mib < 1024]
+        detail = f"{len(gpus)} 张卡,{len(free)} 张空闲;目标架构 {cfg.arch}"
+        checks.append(Check("GPU", True, detail))
+    else:
+        checks.append(Check(
+            "GPU", False, "nvidia-smi 不可用或未检测到 GPU",
+            "确认驱动安装、容器有 --gpus 权限",
+        ))
+
+    # compute-sanitizer
+    san = shutil.which(cfg.sanitizer) or (
+        cfg.sanitizer if Path(cfg.sanitizer).is_file() else None
+    )
+    if san:
+        checks.append(Check("compute-sanitizer", True, san))
+    else:
+        checks.append(Check(
+            "compute-sanitizer", False, f"未找到 {cfg.sanitizer!r}",
+            "通常随 CUDA Toolkit 提供;缺失只影响内存/竞态检查,不影响判分",
+        ))
+
+    # claude CLI(出题与讲评依赖)
+    claude = shutil.which(cfg.claude_bin) or (
+        cfg.claude_bin if Path(cfg.claude_bin).is_file() else None
+    )
+    if claude:
+        code, out = _run([claude, "--version"], timeout=30)
+        ver = out.strip().splitlines()[0] if code == 0 and out.strip() else ""
+        model_note = cfg.claude_model or "继承用户默认"
+        checks.append(Check("claude CLI", True, f"{claude}  {ver}  (模型: {model_note})"))
+    else:
+        checks.append(Check(
+            "claude CLI", False, f"未找到 {cfg.claude_bin!r}",
+            "出题(leet new)与讲评(leet review)需要它;设置 LEETSTUDY_CLAUDE_BIN",
+        ))
+
+    # venv:确认没有误用他人的 anaconda
+    import sys
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    expected = cfg.root / ".venv"
+    if in_venv and Path(sys.prefix) == expected:
+        checks.append(Check("Python 环境", True, f"项目 venv:{sys.prefix}"))
+    elif in_venv:
+        checks.append(Check("Python 环境", True, f"虚拟环境:{sys.prefix}"))
+    else:
+        checks.append(Check(
+            "Python 环境", False, f"未在虚拟环境中运行({sys.prefix})",
+            f"用 {expected}/bin/leet 或先 source {expected}/bin/activate",
+        ))
+
+    return checks
