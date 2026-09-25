@@ -84,6 +84,7 @@ class PyTorchSubject(Subject):
     reference_filename = "reference.py"
     baseline_filename = "baseline.py"
     solution_filename = "solution.py"
+    optimal_filename = "optimal.py"
     supports_sanitize = True
     required_entry_keys = ("function",)
     mutant_docs = _MUTANT_DOC

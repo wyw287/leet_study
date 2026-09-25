@@ -89,6 +89,7 @@ class CudaSubject(Subject):
     reference_filename = "reference.cpp"
     baseline_filename = "baseline.cu"
     solution_filename = "solution.cu"
+    optimal_filename = "optimal.cu"
     supports_sanitize = True
     required_entry_keys = ("kernel", "launcher")
     mutant_docs = _MUTANT_DOC

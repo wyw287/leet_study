@@ -68,6 +68,11 @@ def reference_filename(name: str) -> str:
     return _subject_class(name).reference_filename
 
 
+def optimal_filename(name: str) -> str:
+    """参考解的文件名(可能为空 —— 该科目没定义,或题目还没补)。"""
+    return str(getattr(_subject_class(name), "optimal_filename", ""))
+
+
 def impl_filenames(name: str) -> List[str]:
     """科目需要齐备的实现文件(template / reference / baseline)。"""
     return list(_subject_class(name).required_filenames())
@@ -97,6 +102,6 @@ __all__ = [
     "Artifact", "BuildResult", "CaseResult", "JSON_MARKER", "SanitizeResult",
     "Subject", "available", "get", "is_registered", "DEFAULT_SUBJECT",
     "solution_filename", "template_filename", "baseline_filename",
-    "reference_filename", "impl_filenames", "required_entry_keys",
+    "reference_filename", "optimal_filename", "impl_filenames", "required_entry_keys",
     "mutant_docs", "supports_sanitize", "build_label", "build_note",
 ]

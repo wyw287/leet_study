@@ -14,7 +14,7 @@ CUDA 版是写 `<kernel><<<...>>>`,PyTorch 版是 `ctx.out.fill_(0)`。
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .. import subjects
 from ..config import Config
@@ -100,15 +100,15 @@ def validate_problem(cfg: Config, problem: Problem) -> List[Check]:
     #   参考解本身是「标准答案」,没法自己验自己。但基线是一份独立写出来的朴素
     #   实现 —— 如果它和参考解在每个用例上都一致,两边同时写错的可能性极低。
     #   这是差分测试:用两个独立实现互相印证。
-    bad_cases: List[str] = []
-    baseline_ms: dict = {}
-    for case in problem.cases:
-        r = subject.run_case(baseline_build.artifact, case.name, perf=problem.perf.enabled)
-        if not r.ok:
-            why = r.error_name or "结果不匹配"
-            bad_cases.append(f"{case.name}({why})")
-        elif r.perf_data.get("median_ms"):
-            baseline_ms[case.name] = r.perf_data["median_ms"]
+    baseline_results = {r.case: r for r in subject.run_all_cases(
+        baseline_build.artifact, [c.name for c in problem.cases],
+        perf=problem.perf.enabled, verify_repeat=1,
+    )}
+    bad_cases = [f"{n}({r.error_name or '结果不匹配'})"
+                 for n, r in baseline_results.items() if not r.ok]
+    baseline_ms = {n: r.perf_data["median_ms"]
+                   for n, r in baseline_results.items()
+                   if r.perf_data.get("median_ms")}
     if bad_cases:
         checks.append(("基线通过对拍", False,
                        f"基线与参考解不一致:{', '.join(bad_cases)} —— "
@@ -143,12 +143,83 @@ def validate_problem(cfg: Config, problem: Problem) -> List[Check]:
     else:
         checks.append(("性能地板", True, "本题未开启性能评分,跳过"))
 
-    # ---- 5. 模板与劣化解必须被判失败(区分度检查)----
+    # ---- 5. 参考解:能证明门槛物理可达吗 ----
+    checks.append(_optimal_check(subject, problem, build_root, baseline_results, cfg))
+
+    # ---- 6. 模板与劣化解必须被判失败(区分度检查)----
     checks.append(_template_check(subject, problem, build_root))
     for kind in subject.mutants(problem):
         checks.append(_mutant_check(subject, problem, build_root, kind))
 
     return checks
+
+
+def _optimal_check(subject, problem: Problem, build_root: Path,
+                   baseline_results: Dict[str, Any], cfg: Config) -> Check:
+    """参考解存在吗?它能达到目标评级吗?
+
+    这项检查解决的是一个此前只能靠"出题者自觉"的问题:**性能门槛是否物理可达**。
+    在它之前,`leet validate` 只能查"基线别太慢",无法证明"真的存在一个拿 S 的实现" ——
+    于是设一个永远拿不到的门槛也没人拦得住(转置题的 S=8x 就是这么来的)。
+
+    有了一份达到目标评级的参考解,门槛就有了存在性证明。
+
+    参考解缺失**不算失败**(存量题目需要时间补),但会明确标注出来。
+    """
+    name = "参考解能证明门槛可达"
+    fname = getattr(subject, "optimal_filename", "")
+    if not fname:
+        return (name, True, "该科目未定义参考解文件,跳过")
+
+    path = problem.root / fname
+    if not path.is_file():
+        return (name, True, f"未提供 {fname}(可选;存量题目在陆续补)")
+
+    build = subject.prepare_variant(problem, path, build_root, "chk_optimal")
+    if not build.ok:
+        return (name, False, "参考解无法通过准备阶段:"
+                + " / ".join(build.log.splitlines()[:2]))
+
+    results = subject.run_all_cases(
+        build.artifact, [c.name for c in problem.cases],
+        perf=problem.perf.enabled, verify_repeat=1,
+    )
+
+    # 复用**判分时那套**评分逻辑,不另写一份 —— 否则两处算法会漂移
+    from ..judge import CaseVerdict, Verdict, score_verdict
+    verdict = Verdict(problem=problem)
+    for r in results:
+        verdict.cases.append(CaseVerdict(
+            case=r.case, ok=r.ok, result=r,
+            baseline=baseline_results.get(r.case),
+            repeats=r.verify_total, repeats_ok=r.verify_pass,
+        ))
+    score_verdict(cfg, problem, verdict)
+
+    failed = [c.case for c in verdict.cases if not c.ok]
+    if failed:
+        return (name, False, f"参考解在用例 {', '.join(failed)} 上没过正确性")
+
+    if not problem.perf.grades:
+        return (name, True, f"参考解通过;本题未设评级门槛")
+
+    grade = verdict.grade
+    best = verdict.best_case
+    measured = "?"
+    if best is not None and best.metric_value is not None:
+        if problem.perf.is_bandwidth_metric:
+            # 注意:带宽型题的 metric_value 是 GB/s,评级才用「占峰值百分比」
+            pct = best.bandwidth_pct
+            measured = (f"{pct:.0f}% 峰值({best.metric_value:.0f} GB/s)"
+                        if pct is not None else f"{best.metric_value:.0f} GB/s")
+        else:
+            measured = f"{best.metric_value:.2f}x"
+    if grade in ("S", "A"):
+        return (name, True, f"参考解达标:最好用例 {best.case if best else '?'} "
+                            f"{measured},评级 {grade}")
+    return (name, False,
+            f"参考解只拿到 {grade} 级({measured})—— 说明门槛设高了,"
+            f"存在不了这样的实现;请按实测下调 perf.grades,或改进 {fname}")
 
 
 def _solution_ext(subject: Subject) -> str:

@@ -220,7 +220,7 @@ def load_verdict(cfg: Config, problem: Problem, solution_src: Path,
                  options: Dict[str, Any]) -> Optional[Tuple[Verdict, float]]:
     """读回上次的判题结果。返回 (Verdict, 距今秒数);判据不符或没有则 None。
 
-    读回来的 Verdict 会重新过一遍 `_score` —— 评分逻辑只留一处,不在缓存里存
+    读回来的 Verdict 会重新过一遍 `score_verdict` —— 评分逻辑只留一处,不在缓存里存
     派生出来的评级,避免两处算法漂移。
     """
     path = _cache_path(cfg, problem)
@@ -258,7 +258,7 @@ def load_verdict(cfg: Config, problem: Problem, solution_src: Path,
     ) for c in (payload.get("checks") or [])]
 
     # 评级/加速比/带宽占比都从这里重算,不存进缓存
-    _score(cfg, problem, verdict)
+    score_verdict(cfg, problem, verdict)
     age = max(0.0, time.time() - float(payload.get("created_at") or 0))
     return verdict, age
 
@@ -356,7 +356,7 @@ def judge(
         )
         verdict.cases.append(cv)
 
-    _score(cfg, problem, verdict)
+    score_verdict(cfg, problem, verdict)
 
     # ---- 4. 通过判定:正确性 + 稳定性,性能不卡关 ----
     verdict.passed = (
@@ -389,7 +389,7 @@ def judge(
 # 评分
 # --------------------------------------------------------------------------- #
 
-def _score(cfg: Config, problem: Problem, verdict: Verdict) -> None:
+def score_verdict(cfg: Config, problem: Problem, verdict: Verdict) -> None:
     peak = cfg.resolve_peak_bandwidth()
     for cv in verdict.cases:
         if not cv.ok:

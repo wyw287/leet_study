@@ -145,6 +145,9 @@ class Subject(abc.ABC):
     reference_filename: str = ""
     baseline_filename: str = ""
     solution_filename: str = ""
+    #: 参考解 —— 一份**能达到目标评级**的实现,给卡住的学习者看。
+    #: 可选:缺失时 `leet validate` 会标注「未提供」但不判失败(存量题目需要时间补)。
+    optimal_filename: str = ""
 
     #: 是否支持 compute-sanitizer 那类消毒检查
     supports_sanitize: bool = False

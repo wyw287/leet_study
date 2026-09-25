@@ -555,6 +555,51 @@ def review(ctx: click.Context, problem_id: Optional[str], no_sanitize: bool,
     console.print()
 
 
+@main.command()
+@click.argument("problem_id", required=False)
+@click.pass_context
+def solution(ctx: click.Context, problem_id: Optional[str]) -> None:
+    """看这道题的参考解 —— 一份能达到目标评级的实现。省略题号则取最近编辑过的解答。
+
+    卡住的时候用。没通过这道题时会给一句提示,但不拦着你。
+    """
+    from rich.syntax import Syntax
+
+    cfg = ctx.obj["cfg"]
+    prob = _find(cfg, problem_id, allow_recent=True)
+
+    fname = subjects.optimal_filename(prob.subject)
+    path = (prob.root / fname) if fname else None
+    if path is None or not path.is_file():
+        console.print(f"[yellow]{prob.id} 还没有参考解。[/yellow]")
+        console.print(f"[dim]新建的题目会自带一份(problems/<id>/{fname or 'optimal.*'});"
+                      f"存量题目在陆续补。[/dim]")
+        console.print(f"[dim]不过题面里的「解法思路」一节本身就是很好的指引:"
+                      f"leet show {prob.id}[/dim]")
+        sys.exit(1)
+
+    # 软提示:没通过就给一句话,不阻断 —— 学习工具该提醒,但不该替人做决定
+    progress = bank.Progress.load(cfg.root / bank.PROGRESS_FILENAME)
+    if not progress.get(prob.id).solved:
+        console.print()
+        console.print("[yellow]你还没通过这道题 —— 先自己试过再看,收获会大得多。[/yellow]")
+
+    console.print()
+    console.print(f"[bold]{prob.id} 参考解[/bold]  {prob.title}")
+    console.print(f"[dim]{path.name} · 评分指标 {prob.perf.metric} · "
+                  f"门槛 {prob.perf.grades or '(未设)'}[/dim]")
+    console.print("[dim]" + "─" * 62 + "[/dim]")
+
+    lang = "cuda" if prob.subject == "cuda" else "python"
+    console.print(Syntax(path.read_text(encoding="utf-8"), lang,
+                         line_numbers=True, background_color="default"))
+
+    console.print()
+    console.print(f"[dim]它为什么快、有哪些坑,题面里讲了:leet show {prob.id}[/dim]")
+    console.print(f"[dim]想自己验证一遍:先把上面的代码存进 "
+                  f"{bank.solution_path(cfg.solutions_dir, prob)},再 leet test[/dim]\n")
+
+
 def _dump_raw(console: Console, verdict) -> None:
     import json
     console.print("\n[dim]── 原始数据 ──[/dim]")
