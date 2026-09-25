@@ -26,9 +26,36 @@ def _load_bank(cfg):
     return problems, broken
 
 
-def _find(cfg, query: str):
+def _find(cfg, query: Optional[str], *, allow_recent: bool = False):
+    """把题号解析成 Problem。
+
+    query 为空且 allow_recent 时,自动选**最近编辑过的解答**所在的题目 ——
+    做题时反复 `leet test` 不必每次敲题号。
+    选了什么会明确打印出来(带编辑时间),避免"它怎么选了这个"的困惑。
+    """
     problems, broken = _load_bank(cfg)
     report.render_broken(console, broken)
+
+    if not query:
+        if not allow_recent:
+            console.print("[red]需要指定题号。[/red]")
+            sys.exit(1)
+        found = bank.find_recent_solution(cfg.solutions_dir, problems)
+        if found is None:
+            console.print("[red]没有找到任何解答文件。[/red]")
+            console.print("[dim]先用 `leet start <题号>` 创建一份。[/dim]")
+            if problems:
+                console.print("[dim]可用题目:[/dim]")
+                for p in problems:
+                    console.print(f"  [bold]{p.id}[/bold]  {p.title}")
+            sys.exit(1)
+        prob, _path, age = found
+        console.print(
+            f"[dim]未指定题号 → 最近编辑的解答:[/dim] "
+            f"[bold]{prob.id}[/bold] [dim]({report.humanize_age(age)})[/dim]"
+        )
+        return prob
+
     prob = bank.resolve(problems, query)
     if prob is None:
         hits = bank.resolve_many(problems, query)
@@ -91,12 +118,12 @@ def list_cmd(ctx: click.Context, tag: Optional[str], difficulty: Optional[int],
 
 
 @main.command()
-@click.argument("problem_id")
+@click.argument("problem_id", required=False)
 @click.pass_context
-def show(ctx: click.Context, problem_id: str) -> None:
-    """读题面。"""
+def show(ctx: click.Context, problem_id: Optional[str]) -> None:
+    """读题面。省略题号则取最近编辑过的解答。"""
     cfg = ctx.obj["cfg"]
-    prob = _find(cfg, problem_id)
+    prob = _find(cfg, problem_id, allow_recent=True)
     sol = bank.solution_path(cfg.solutions_dir, prob)
     tip = f"解答文件:{sol}" if sol.is_file() else f"还没开始。运行 `leet start {prob.id}` 创建工作区。"
     report.render_statement(console, prob, tip)
@@ -133,20 +160,20 @@ def start(ctx: click.Context, problem_id: str, force: bool) -> None:
 
 
 @main.command()
-@click.argument("problem_id")
+@click.argument("problem_id", required=False)
 @click.option("--case", "cases", multiple=True, help="只跑指定用例(可重复)")
 @click.option("--no-sanitize", is_flag=True, help="跳过内存检查(更快)")
 @click.option("--race", is_flag=True, help="强制跑竞态检查(很慢,仅在小用例上)")
 @click.option("--gpu", type=int, default=None, help="指定物理 GPU 序号")
 @click.option("-v", "--verbose", is_flag=True, help="显示原始输出")
 @click.pass_context
-def test(ctx: click.Context, problem_id: str, cases: List[str], no_sanitize: bool,
-         race: bool, gpu: Optional[int], verbose: bool) -> None:
-    """编译 + 判分。这是主命令。"""
+def test(ctx: click.Context, problem_id: Optional[str], cases: List[str],
+         no_sanitize: bool, race: bool, gpu: Optional[int], verbose: bool) -> None:
+    """编译 + 判分。这是主命令。省略题号则取最近编辑过的解答。"""
     cfg = ctx.obj["cfg"]
     if gpu is not None:
         cfg.gpu = gpu
-    prob = _find(cfg, problem_id)
+    prob = _find(cfg, problem_id, allow_recent=True)
     sol = bank.solution_path(cfg.solutions_dir, prob)
 
     if not sol.is_file():
@@ -182,18 +209,18 @@ def test(ctx: click.Context, problem_id: str, cases: List[str], no_sanitize: boo
 
 
 @main.command()
-@click.argument("problem_id")
+@click.argument("problem_id", required=False)
 @click.option("--repeat", type=int, default=200, help="计时重复次数(默认 200,比 test 更稳)")
 @click.option("--case", "cases", multiple=True)
 @click.option("--gpu", type=int, default=None)
 @click.pass_context
-def bench(ctx: click.Context, problem_id: str, repeat: int, cases: List[str],
-          gpu: Optional[int]) -> None:
-    """只测性能,不跑内存/竞态检查,重复更多次以获得更稳的数字。"""
+def bench(ctx: click.Context, problem_id: Optional[str], repeat: int,
+          cases: List[str], gpu: Optional[int]) -> None:
+    """只测性能,不跑内存/竞态检查,重复更多次以获得更稳的数字。省略题号则取最近编辑过的解答。"""
     cfg = ctx.obj["cfg"]
     if gpu is not None:
         cfg.gpu = gpu
-    prob = _find(cfg, problem_id)
+    prob = _find(cfg, problem_id, allow_recent=True)
     sol = bank.solution_path(cfg.solutions_dir, prob)
     if not sol.is_file():
         console.print(f"[red]还没有解答文件:{sol}[/red]")
@@ -388,15 +415,15 @@ def new(ctx: click.Context, requirement: tuple, subject: str, repair_rounds: int
 
 
 @main.command()
-@click.argument("problem_id")
+@click.argument("problem_id", required=False)
 @click.option("--no-sanitize", is_flag=True, help="讲评前跳过内存检查")
 @click.pass_context
-def review(ctx: click.Context, problem_id: str, no_sanitize: bool) -> None:
-    """让本地 claude 讲评你的 kernel(结合性能数据与消毒报告)。"""
+def review(ctx: click.Context, problem_id: Optional[str], no_sanitize: bool) -> None:
+    """让本地 claude 讲评你的 kernel(结合性能数据与消毒报告)。省略题号则取最近编辑过的解答。"""
     from .authoring import agent, prompts
 
     cfg = ctx.obj["cfg"]
-    prob = _find(cfg, problem_id)
+    prob = _find(cfg, problem_id, allow_recent=True)
     sol = bank.solution_path(cfg.solutions_dir, prob)
     if not sol.is_file():
         console.print(f"[red]还没有解答文件:{sol}[/red]")

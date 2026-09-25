@@ -85,17 +85,39 @@ $EDITOR solutions/01-vector-add/solution.cu
 |---|---|
 | `leet doctor` | 环境自检(nvcc / GPU / sanitizer / claude / torch / ninja / venv) |
 | `leet list [--tag T] [--diff N] [--status todo\|done]` | 题库浏览 + 完成状态 |
-| `leet show <题号>` | 读题面 |
+| `leet show [题号]` | 读题面 |
 | `leet start <题号> [--force]` | 从模板生成解答文件 |
-| `leet test <题号> [--case C] [--no-sanitize] [--race] [--gpu N] [-v]` | **主命令**:编译 + 判分 |
-| `leet bench <题号> [--repeat N]` | 只测性能,重复更多次 |
-| `leet review <题号>` | 让本地 claude 讲评你的 kernel |
+| `leet test [题号] [--case C] [--no-sanitize] [--race] [--gpu N] [-v]` | **主命令**:编译 + 判分 |
+| `leet bench [题号] [--repeat N]` | 只测性能,重复更多次 |
+| `leet review [题号]` | 让本地 claude 讲评你的 kernel |
 | `leet new "<需求>" [--subject pytorch]` | 让本地 claude 自动出题(含自验证与修复回路) |
 | `leet validate [--all\|<题号>]` | 题库健康检查 |
 | `leet stats` | 学习进度看板 |
 | `leet clean` | 清理编译产物 |
 
-题号支持 `1` / `01` / `vector` 这类宽松写法。
+### 题号可以省略
+
+`test` / `bench` / `review` / `show` 的题号都是可选的 —— 省略时**自动选最近编辑过的
+那份解答**,并且会明确告诉你是谁:
+
+```
+$ leet test
+未指定题号 → 最近编辑的解答: 03-matrix-transpose (2 分钟前)
+```
+
+于是常见的工作流变成:
+
+```bash
+leet start 5      # 开始一道新题
+$EDITOR solutions/05-conv2d/solution.cu
+leet test         # 不用敲题号
+leet test         # 改了再跑,还是不用敲
+```
+
+判据是解答文件的修改时间,所以 `leet start` 之后紧接着 `leet test` 也符合直觉。
+想指定别的题就正常传题号。
+
+题号本身也支持 `1` / `01` / `vector` 这类宽松写法。
 
 > `leet` 装在项目内 venv 里,**不在 PATH 上**。嫌麻烦就加个别名:
 > `echo "alias leet='<仓库路径>/.venv/bin/leet'" >> ~/.bashrc`

@@ -30,6 +30,19 @@ def difficulty_bar(level: int, width: int = 5) -> str:
     return "●" * level + "○" * (width - level)
 
 
+def humanize_age(seconds: float) -> str:
+    """把「距今多少秒」说成人话。用于「自动选了哪个解答」这类场合。"""
+    if seconds < 10:
+        return "刚刚"
+    if seconds < 60:
+        return f"{int(seconds)} 秒前"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} 分钟前"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} 小时前"
+    return f"{int(seconds // 86400)} 天前"
+
+
 def grade_bar(grade: Optional[str], width: int = 10) -> str:
     if not grade:
         return "░" * width

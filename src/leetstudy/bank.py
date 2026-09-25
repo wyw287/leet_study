@@ -174,6 +174,32 @@ def solution_path(solutions_dir: Path, problem: Problem) -> Path:
     return solutions_dir / problem.id / subjects.solution_filename(problem.subject)
 
 
+def find_recent_solution(
+    solutions_dir: Path, problems: List[Problem]
+) -> Optional[Tuple[Problem, Path, float]]:
+    """找出最近编辑过的解答,返回 (题目, 解答路径, 距今秒数)。
+
+    判据是文件 mtime —— 简单且可预测。`leet start <id>` 刚创建的解答也算"最近",
+    这正合使用者心意:start 完就该 test。
+
+    题目目录被删掉、或 spec 加载失败的,自然不在 problems 里,会被跳过。
+    """
+    best: Optional[Tuple[float, Problem, Path]] = None
+    for prob in problems:
+        path = solution_path(solutions_dir, prob)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue          # 还没 start 过这道题
+        # mtime 相同时按 id 排序,保证结果确定
+        if best is None or (mtime, prob.id) > (best[0], best[1].id):
+            best = (mtime, prob, path)
+    if best is None:
+        return None
+    import time as _time
+    return best[1], best[2], max(0.0, _time.time() - best[0])
+
+
 def all_missing_files(problems: List[Problem]) -> List[Tuple[str, List[str]]]:
     """返回文件不齐的题目,供 `leet validate` 使用。"""
     from . import subjects
