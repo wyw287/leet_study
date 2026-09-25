@@ -7,13 +7,15 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -81,8 +83,45 @@ class GpuInfo:
         )
 
 
-def list_gpus() -> List[GpuInfo]:
-    """枚举物理 GPU。nvidia-smi 不可用时返回空列表。"""
+# nvidia-smi 在某些机器上**极慢**(本机实测每次 4.3 秒,与参数无关,也不缓存)。
+# 而它出现的地方大多只是想知道"有哪些卡、算力多少" —— 这些信息一天之内不会变。
+# 所以做两级缓存:
+#   * 进程内 memo        —— 同一条命令里多次探测只付一次代价
+#   * 磁盘缓存(带 TTL)  —— 跨命令复用;利用率取短 TTL,架构取长 TTL
+_UTIL_TTL_SECONDS = 60.0         # 显存/利用率:一分钟的陈旧无伤大雅
+#   为什么不是几秒:一次判题要好几十秒,如果 TTL 比判题还短,那每个用例都会
+#   重新探测一次(本机 4.3s/次 × 每个用例)。而"哪张卡最闲"这个判断按分钟级
+#   陈旧完全够用 —— GPU 占用是以训练任务为尺度变化的,不是以秒。
+_ARCH_TTL_SECONDS = 30 * 86400   # 架构/卡名:机器不变就不会变
+_nvidia_smi_memo: Dict[str, Any] = {"at": 0.0, "gpus": None}
+#: 本次进程内已经定下来的 GPU 选择。一次判题里绝不该改主意 ——
+#: 既省掉重复探测,也保证同一次运行的所有用例落在同一张卡上,计时才可比。
+_pick_memo: Dict[Any, Optional[int]] = {}
+
+
+def _cache_file() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
+    return Path(base) / "leetstudy" / "gpu.json"
+
+
+def _read_disk_cache() -> Dict[str, Any]:
+    try:
+        return json.loads(_cache_file().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_disk_cache(data: Dict[str, Any]) -> None:
+    path = _cache_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass  # 缓存写不进去不是错误,只是下次还得再探一次
+
+
+def _probe_gpus() -> List[GpuInfo]:
+    """真正去问 nvidia-smi。这是唯一会付那 4 秒代价的地方。"""
     code, out = _run([
         "nvidia-smi",
         "--query-gpu=index,name,compute_cap,memory.used,memory.total,utilization.gpu",
@@ -90,7 +129,6 @@ def list_gpus() -> List[GpuInfo]:
     ])
     if code != 0:
         return []
-
     gpus: List[GpuInfo] = []
     for line in out.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
@@ -110,31 +148,87 @@ def list_gpus() -> List[GpuInfo]:
     return gpus
 
 
+def list_gpus() -> List[GpuInfo]:
+    """枚举物理 GPU,带缓存。
+
+    缓存顺序:进程内 memo → 磁盘缓存(TTL 内)→ 重新探测。
+    绝大多数命令落在这三层的前两层,不必付 nvidia-smi 的启动开销。
+    """
+    now = time.time()
+
+    # 1) 进程内
+    if _nvidia_smi_memo["gpus"] is not None and \
+            now - _nvidia_smi_memo["at"] < _UTIL_TTL_SECONDS:
+        return _nvidia_smi_memo["gpus"]
+
+    # 2) 磁盘
+    disk = _read_disk_cache()
+    probed_at = float(disk.get("probed_at") or 0)
+    if disk.get("gpus") and now - probed_at < _UTIL_TTL_SECONDS:
+        gpus = [GpuInfo(**g) for g in disk["gpus"]]
+        _nvidia_smi_memo.update({"at": now, "gpus": gpus})
+        return gpus
+
+    # 3) 真去探测
+    gpus = _probe_gpus()
+    _nvidia_smi_memo.update({"at": now, "gpus": gpus})
+    if gpus:
+        disk.update({
+            "probed_at": now,
+            "gpus": [asdict(g) for g in gpus],
+            # 架构信息一次探测长期有效
+            "arch": f"sm_{gpus[0].compute_cap.replace('.', '')}",
+            "arch_at": now,
+            "gpu_name": gpus[0].name,
+        })
+        _write_disk_cache(disk)
+    return gpus
+
+
 def pick_gpu(explicit: Optional[int] = None) -> Optional[int]:
     """挑一张空闲 GPU。
 
     优先级:显式指定 > CUDA_VISIBLE_DEVICES > 按 (利用率, 已用显存) 升序挑最闲的。
     返回物理 GPU 序号;None 表示交给驱动默认(不设 CUDA_VISIBLE_DEVICES)。
+
+    结果在进程内缓存:同一次判题的所有用例必须落在同一张卡上,否则计时不可比;
+    顺带也省掉反复探测 nvidia-smi 的开销。
     """
     if explicit is not None:
         return explicit
     if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
         return None  # 用户已经安排好可见性,别覆盖
 
+    if explicit in _pick_memo:
+        return _pick_memo[explicit]
+
     gpus = list_gpus()
     if not gpus:
-        return None
-    best = min(gpus, key=lambda g: (g.util_pct, g.mem_used_mib))
-    # 唯一一张卡时也别费事
-    return best.index if len(gpus) > 1 else None
+        chosen = None
+    else:
+        best = min(gpus, key=lambda g: (g.util_pct, g.mem_used_mib))
+        # 唯一一张卡时也别费事
+        chosen = best.index if len(gpus) > 1 else None
+    _pick_memo[explicit] = chosen
+    return chosen
 
 
 # --------------------------------------------------------------------------- #
 # 编译
 # --------------------------------------------------------------------------- #
 
-def detect_arch() -> str:
-    """探测目标架构,如 sm_89。用于 nvcc -arch。"""
+def detect_arch(use_cache: bool = True) -> str:
+    """探测目标架构,如 sm_89。用于 nvcc -arch / TORCH_CUDA_ARCH_LIST。
+
+    优先走磁盘缓存 —— 架构是一台机器上最不会变的信息,而探测它要 4 秒。
+    """
+    if use_cache:
+        disk = _read_disk_cache()
+        arch = disk.get("arch")
+        arch_at = float(disk.get("arch_at") or 0)
+        if arch and time.time() - arch_at < _ARCH_TTL_SECONDS:
+            return str(arch)
+
     gpus = list_gpus()
     if gpus:
         cap = gpus[0].compute_cap.replace(".", "")
@@ -193,7 +287,10 @@ class Config:
     nvcc: str = "nvcc"
     sanitizer: str = "compute-sanitizer"
     claude_bin: str = "claude"
-    arch: str = "sm_89"
+    #: 目标架构。**惰性求值** —— 探测它要跑 nvidia-smi,而本机实测每次要 4 秒;
+    #: 可是 `leet list` / `show` / `start` 这些命令压根不需要它。
+    #: 只有真要编译/跑题时才付这个代价。外部仍可用 `cfg.arch = "sm_80"` 覆盖。
+    _arch: Optional[str] = None
     gpu: Optional[int] = None            # 显式指定的物理 GPU
     claude_model: Optional[str] = None   # None = 继承用户默认(本机是自定义模型)
     claude_extra_args: List[str] = field(default_factory=list)
@@ -216,6 +313,21 @@ class Config:
         if not gpus:
             return None
         return lookup_peak_bandwidth(gpus[0].name)
+
+    @property
+    def arch(self) -> str:
+        """目标架构,如 sm_89。**首次访问时才探测**。
+
+        探测要跑 nvidia-smi(本机约 4 秒),而只有真的要编译或跑题时才需要它 ——
+        `leet list` / `show` / `start` 都不碰这个属性,所以不会付这个代价。
+        """
+        if self._arch is None:
+            self._arch = detect_arch()
+        return self._arch
+
+    @arch.setter
+    def arch(self, value: Optional[str]) -> None:
+        self._arch = value
 
     @property
     def problems_dir(self) -> Path:
@@ -271,7 +383,9 @@ def load_config(root: Optional[Path] = None) -> Config:
     cfg.nvcc = env("NVCC") or str(raw.get("nvcc") or cfg.nvcc)
     cfg.sanitizer = env("SANITIZER") or str(raw.get("sanitizer") or cfg.sanitizer)
     cfg.claude_bin = env("CLAUDE_BIN") or str(raw.get("claude_bin") or cfg.claude_bin)
-    cfg.arch = env("ARCH") or str(raw.get("arch") or "") or detect_arch()
+    # 架构留空 → 惰性探测;只有显式配置时才在这里定下来
+    explicit_arch = env("ARCH") or raw.get("arch")
+    cfg.arch = str(explicit_arch) if explicit_arch else None
     cfg.claude_model = env("CLAUDE_MODEL") or raw.get("claude_model") or None
 
     # 路径类设置:相对路径按仓库根解析

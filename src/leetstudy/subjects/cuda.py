@@ -1,6 +1,7 @@
 """CUDA 科目的判题实现:nvcc 编译、执行、compute-sanitizer 消毒检查。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -111,14 +112,15 @@ class CudaSubject(Subject):
         """把一份实现编译成可执行文件。
 
         out_dir 是 build/<problem>/,每个变体在 out_dir/<label>/ 下独立编译。
+
+        带编译缓存:源码、spec、架构、编译选项都没变且产物还在,就直接复用 ——
+        基线几乎永远命中,用户反复跑 bench/test 也能省下一次 nvcc。
+        缓存判据是内容哈希,所以改一个字符就会失效,不会用到过期的二进制。
         """
         # 全部转绝对路径:nvcc 的工作目录是 variant_dir,相对路径会解析错
         build_root = Path(out_dir).resolve()
         impl_src = Path(impl_src).resolve()
-
-        codegen.write_ctx_h(problem, build_root)
         variant_dir = build_root / label
-        files = codegen.write_variant(problem, variant_dir, impl_src)
         exe = variant_dir / "harness"
 
         reference = (problem.root / self.reference_filename).resolve()
@@ -127,6 +129,22 @@ class CudaSubject(Subject):
                 ok=False,
                 stderr=f"缺少参考解文件 {reference}",
             )
+
+        stamp = _build_stamp(problem, impl_src, reference, self.cfg)
+        stamp_file = variant_dir / "build.stamp"
+        if exe.is_file() and stamp_file.is_file():
+            try:
+                if stamp_file.read_text(encoding="utf-8").strip() == stamp:
+                    return BuildResult(
+                        ok=True, artifact=Artifact(kind="exe", path=exe),
+                        seconds=0.0, cmd=[],
+                        stdout="(编译缓存命中)",
+                    )
+            except OSError:
+                pass
+
+        codegen.write_ctx_h(problem, build_root)
+        files = codegen.write_variant(problem, variant_dir, impl_src)
 
         cmd: List[str] = [
             self.cfg.nvcc,
@@ -163,6 +181,11 @@ class CudaSubject(Subject):
             return BuildResult(ok=False, cmd=cmd, stderr=f"编译失败:{exc}")
 
         ok = proc.returncode == 0 and exe.is_file()
+        if ok:
+            try:
+                stamp_file.write_text(stamp, encoding="utf-8")
+            except OSError:
+                pass
         return BuildResult(
             ok=ok,
             artifact=Artifact(kind="exe", path=exe) if ok else None,
@@ -219,6 +242,75 @@ class CudaSubject(Subject):
             returncode=proc.returncode,
             perf=perf,
         )
+
+    def run_all_cases(
+        self,
+        artifact: Artifact,
+        cases: List[str],
+        perf: bool = False,
+        verify_repeat: int = 1,
+        timeout: Optional[int] = None,
+        extra_args: Optional[List[str]] = None,
+    ) -> List[CaseResult]:
+        """一次进程跑完所有用例(以及进程内的稳定性重复)。
+
+        这是本框架性能上最关键的一处优化:本机实测 CUDA 上下文初始化要 4.4 秒
+        (空程序 `cudaFree(0)` 亦然),而 kernel 本身常常只跑一百多微秒。
+        若每个用例、每次稳定性重复都起一个进程,判题时间的 90% 以上会花在
+        进程启动上 —— 实测 8 次进程启动把 `leet test` 拖到了 49 秒。
+        """
+        exe = artifact.path
+        # harness 支持 "all" 或单个用例名。只挑一个用例时就精确指定,
+        # 免得白跑其余的。
+        selector = cases[0] if len(cases) == 1 else "all"
+        cmd = [str(exe), "--case", selector,
+               "--verify-repeat", str(max(1, verify_repeat))]
+        if perf:
+            cmd.append("--perf")
+        cmd += list(extra_args or [])
+
+        env = self.cfg.env_for_gpu(None)
+        limit = timeout or max(self.cfg.run_timeout, 60 * len(cases))
+        t0 = time.time()
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=limit,
+                env=env,
+                cwd=str(exe.parent),
+            )
+        except subprocess.TimeoutExpired:
+            why = (f"执行超时(>{limit}s)。常见原因:kernel 死循环,"
+                   f"或启动配置把工作量放大了几个数量级。")
+            return [CaseResult(case=c, ok=False, timed_out=True, perf=perf,
+                               seconds=time.time() - t0, stderr=why) for c in cases]
+        except OSError as exc:
+            return [CaseResult(case=c, ok=False, perf=perf,
+                               stderr=f"无法执行:{exc}") for c in cases]
+
+        elapsed = time.time() - t0
+        by_case = {r.get("case"): r for r in _parse_markers(proc.stdout) if r.get("case")}
+        results: List[CaseResult] = []
+        for name in cases:
+            raw = by_case.get(name)
+            if raw is None:
+                # 没产出结果 —— 进程多半在半路挂了(段错误等)。
+                # 把已完成的用例结果保留住,不要因为一个用例崩了就把全部丢掉。
+                results.append(CaseResult(
+                    case=name, ok=False, raw={}, perf=perf,
+                    stdout=proc.stdout, stderr=proc.stderr,
+                    seconds=elapsed, returncode=proc.returncode,
+                ))
+            else:
+                results.append(CaseResult(
+                    case=name, ok=bool(raw.get("ok")), raw=raw, perf=perf,
+                    stdout=proc.stdout, stderr=proc.stderr,
+                    seconds=elapsed, returncode=proc.returncode,
+                ))
+        return results
 
     # ------------------------------------------------------------------ #
     # 内存 / 竞态检查
@@ -289,11 +381,32 @@ class CudaSubject(Subject):
 # 解析辅助
 # --------------------------------------------------------------------------- #
 
-def _parse_marker(stdout: str) -> Dict[str, Any]:
-    """从输出里找出 harness 打印的那行 JSON。
+def _build_stamp(problem: Problem, impl_src: Path, reference: Path,
+                 cfg: Config) -> str:
+    """编译缓存的判据:源码 + 参考解 + spec + 架构 + 编译选项的内容哈希。
 
+    刻意用**内容**而不是 mtime:mtime 会被 touch / git checkout 之类与代码无关的
+    操作改动,而那些情况下重新编译纯属浪费;反过来内容变了一定要重编。
+    """
+    h = hashlib.sha256()
+    h.update(f"arch={cfg.arch}\nflags={' '.join(_NVCC_FLAGS)}\n".encode())
+    for path in (impl_src, reference, problem.root / "spec.yaml"):
+        h.update(f"--{path.name}--\n".encode())
+        try:
+            h.update(path.read_bytes())
+        except OSError:
+            h.update(b"<missing>")
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _parse_markers(stdout: str) -> List[Dict[str, Any]]:
+    """解析输出里**所有**带标记的 JSON 行。
+
+    一个 harness 进程会为每个用例打印一行(见 codegen 的说明),所以要收全。
     用户 kernel 里的 printf 可能混在输出中,所以只认带标记的那一行。
     """
+    found: List[Dict[str, Any]] = []
     for line in stdout.splitlines():
         idx = line.find(codegen.JSON_MARKER)
         if idx < 0:
@@ -304,8 +417,14 @@ def _parse_marker(stdout: str) -> Dict[str, Any]:
         except json.JSONDecodeError:
             continue
         if isinstance(parsed, dict):
-            return parsed
-    return {}
+            found.append(parsed)
+    return found
+
+
+def _parse_marker(stdout: str) -> Dict[str, Any]:
+    """只要第一条(单用例调用用)。"""
+    found = _parse_markers(stdout)
+    return found[0] if found else {}
 
 
 def _parse_sanitizer(tool: str, output: str) -> tuple:

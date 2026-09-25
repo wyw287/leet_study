@@ -117,7 +117,13 @@ def judge(
     force_racecheck: bool = False,
     case_filter: Optional[List[str]] = None,
     verbose: bool = False,
+    perf_repeat: Optional[int] = None,
 ) -> Verdict:
+    """跑一次完整判题。
+
+    perf_repeat 覆盖题目 spec 里的计时重复次数(leet bench 用它跑更多次以更稳)。
+    用户解与基线会用**同一个**次数,否则加速比不可比。
+    """
     t0 = time.time()
     subject = subjects.get(problem.subject, cfg)
     build_root = cfg.build_dir_for(problem.id)
@@ -145,6 +151,8 @@ def judge(
     )
 
     # ---- 3. 逐用例:正确性 + 稳定性 ----
+    #   一次进程跑完所有用例(以及进程内的稳定性重复)。科目可以覆盖这个行为;
+    #   CUDA 科目必须覆盖 —— 本机 CUDA 上下文初始化要 4.4 秒,用例一多就吃不消。
     selected: List[Case] = problem.cases
     if case_filter:
         wanted = set(case_filter)
@@ -157,25 +165,37 @@ def judge(
             return verdict
 
     reps = max(1, problem.verify.repeat)
-    for case in selected:
-        result = subject.run_case(build.artifact, case.name, perf=problem.perf.enabled)
-        ok_count = 1 if result.ok else 0
-        # 再跑几遍确认稳定 —— 抓竞态 / 未初始化内存这类「有时对有时错」的问题
-        for _ in range(reps - 1):
-            again = subject.run_case(build.artifact, case.name, perf=False)
-            if again.ok:
-                ok_count += 1
+    # 用户解与基线共用同一组计时参数,加速比才可比
+    perf_args = ["--repeat", str(perf_repeat)] if perf_repeat else None
+    names = [c.name for c in selected]
 
+    results = subject.run_all_cases(
+        build.artifact, names,
+        perf=problem.perf.enabled, verify_repeat=reps, extra_args=perf_args,
+    )
+    by_case = {r.case: r for r in results}
+
+    # 基线:只对**跑对**的用例计时(正确性没过时性能数字没有意义,
+    # 而基线计时不便宜);同样一次进程跑完。
+    baseline_by_case: Dict[str, CaseResult] = {}
+    ok_names = [r.case for r in results if r.ok]
+    if ok_names and verdict.baseline_build.ok and verdict.baseline_build.artifact:
+        for br in subject.run_all_cases(
+            verdict.baseline_build.artifact, ok_names,
+            perf=problem.perf.enabled, verify_repeat=1, extra_args=perf_args,
+        ):
+            baseline_by_case[br.case] = br
+
+    for case in selected:
+        result = by_case.get(case.name)
+        if result is None:
+            result = CaseResult(case=case.name, ok=False,
+                                stderr="没有拿到这个用例的结果")
         cv = CaseVerdict(
             case=case.name, ok=result.ok, result=result,
-            repeats=reps, repeats_ok=ok_count,
+            repeats=result.verify_total, repeats_ok=result.verify_pass,
+            baseline=baseline_by_case.get(case.name),
         )
-        # 只在用例跑对时才测基线:正确性没过的话,性能数字没有意义,
-        # 而基线计时(50 次 + 每次清 L2)不便宜,不该白花。
-        if result.ok and verdict.baseline_build.ok and verdict.baseline_build.artifact:
-            cv.baseline = subject.run_case(
-                verdict.baseline_build.artifact, case.name, perf=problem.perf.enabled
-            )
         verdict.cases.append(cv)
 
     _score(cfg, problem, verdict)

@@ -103,6 +103,20 @@ class CaseResult:
     def perf_data(self) -> Dict[str, float]:
         return self.raw.get("perf") or {}
 
+    @property
+    def verify_pass(self) -> int:
+        """稳定性重复里通过了几次。"""
+        return int(self.raw.get("verify_pass", 1 if self.ok else 0))
+
+    @property
+    def verify_total(self) -> int:
+        return int(self.raw.get("verify_total", 1))
+
+    @property
+    def stable(self) -> bool:
+        """同一份输入重复跑是否每次都通过 —— 不通过就是竞态/未初始化内存的特征。"""
+        return self.verify_pass == self.verify_total
+
 
 @dataclass
 class SanitizeResult:
@@ -169,6 +183,45 @@ class Subject(abc.ABC):
     ) -> CaseResult:
         """运行一个用例,返回结构化结果。"""
         raise NotImplementedError
+
+    def run_all_cases(
+        self,
+        artifact: Artifact,
+        cases: List[str],
+        perf: bool = False,
+        verify_repeat: int = 1,
+        timeout: Optional[int] = None,
+        extra_args: Optional[List[str]] = None,
+    ) -> List[CaseResult]:
+        """批量跑用例,返回与 cases 等长的结果列表(顺序一致)。
+
+        默认实现是逐个跑 —— 那对解释型科目够用(Python 启动便宜)。CUDA 科目
+        会覆盖它:本机实测 CUDA 上下文初始化要 4.4 秒,每个用例起一个进程
+        根本无法接受,所以它一次进程跑完所有用例。
+
+        实现者要保证:返回结果的 `verify_pass/verify_total` 反映**进程内**的
+        稳定性重复次数,而不是靠外层反复调用。
+        """
+        out: List[CaseResult] = []
+        for case in cases:
+            first: Optional[CaseResult] = None
+            passed = 0
+            for _ in range(max(1, verify_repeat)):
+                r = self.run_case(artifact, case, perf=perf and first is None,
+                                  timeout=timeout, extra_args=extra_args)
+                if first is None:
+                    first = r
+                if r.ok:
+                    passed += 1
+            assert first is not None
+            # 用总的重复次数改写稳定性计数:默认实现下由外层循环提供
+            first.raw = {**first.raw,
+                         "verify_pass": passed,
+                         "verify_total": max(1, verify_repeat),
+                         "ok": passed == max(1, verify_repeat)}
+            first.ok = bool(first.raw["ok"])
+            out.append(first)
+        return out
 
     # ---- 可选实现(有默认值) ---------------------------------------------- #
 

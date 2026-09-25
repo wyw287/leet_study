@@ -201,7 +201,8 @@ def bench(ctx: click.Context, problem_id: str, repeat: int, cases: List[str],
 
     with console.status(f"[dim]计时中(重复 {repeat} 次)...[/dim]", spinner="dots"):
         verdict = judge(cfg, prob, sol, do_sanitize=False,
-                        case_filter=list(cases) or None)
+                        case_filter=list(cases) or None,
+                        perf_repeat=repeat)
     report.render_verdict(console, cfg, verdict, show_hints=False)
 
 

@@ -122,42 +122,48 @@ def _fill_expr(buf: Buffer) -> str:
     return f"({ct})(rng.uni() * 2.0 - 1.0)"
 
 
-def _compare_body(buf: Buffer, atol: float, rtol: float) -> str:
+def _compare_body(buf: Buffer, atol: float, rtol: float,
+                  indent: str = "        ") -> str:
     """单个 out buffer 的逐元素比较体,直接累加到外层变量(max_abs_<name> 等)。"""
     n = buf.name
     if buf.dtype in _FLOAT_DTYPES:
         # 两边都是 NaN 视为相等(有些题合法地产生 NaN);只有一边是 NaN 则算错。
-        return f"""        bool both_nan = (std::isnan(got) && std::isnan(exp));
-        bool one_nan  = (std::isnan(got) != std::isnan(exp));
-        if (std::isnan(got)) ++nan_{n};
-        else if (std::isinf(got)) ++inf_{n};
-        double d = std::fabs(got - exp);
-        double tol = {atol!r} + {rtol!r} * std::fabs(exp);
-        double rel = d / (std::fabs(exp) > 1e-30 ? std::fabs(exp) : 1e-30);
-        if (!both_nan) {{
-            if (d > max_abs_{n}) max_abs_{n} = d;
-            if (rel > max_rel_{n}) max_rel_{n} = rel;
-        }}
-        if (!(both_nan || (!one_nan && d <= tol))) {{
-            ++bad_{n};
-            if (first_bad_{n} < 0) {{ first_bad_{n} = i; first_got_{n} = got; first_exp_{n} = exp; }}
-        }}
+        body = f"""bool both_nan = (std::isnan(got) && std::isnan(exp));
+bool one_nan  = (std::isnan(got) != std::isnan(exp));
+if (std::isnan(got)) ++nan_{n};
+else if (std::isinf(got)) ++inf_{n};
+double d = std::fabs(got - exp);
+double tol = {atol!r} + {rtol!r} * std::fabs(exp);
+double rel = d / (std::fabs(exp) > 1e-30 ? std::fabs(exp) : 1e-30);
+if (!both_nan) {{
+    if (d > max_abs_{n}) max_abs_{n} = d;
+    if (rel > max_rel_{n}) max_rel_{n} = rel;
+}}
+if (!(both_nan || (!one_nan && d <= tol))) {{
+    ++bad_{n};
+    if (first_bad_{n} < 0) {{ first_bad_{n} = i; first_got_{n} = got; first_exp_{n} = exp; }}
+}}
 """
-    # 整数类型要求精确相等(atol/rtol 对整数无意义)
-    return f"""        long long di = (long long)got - (long long)exp;
-        double ad = (double)(di < 0 ? -di : di);
-        if (ad > max_abs_{n}) max_abs_{n} = ad;
-        if (di != 0) {{
-            ++bad_{n};
-            if (first_bad_{n} < 0) {{ first_bad_{n} = i; first_got_{n} = got; first_exp_{n} = exp; }}
-        }}
+    else:
+        # 整数类型要求精确相等(atol/rtol 对整数无意义)
+        body = f"""long long di = (long long)got - (long long)exp;
+double ad = (double)(di < 0 ? -di : di);
+if (ad > max_abs_{n}) max_abs_{n} = ad;
+if (di != 0) {{
+    ++bad_{n};
+    if (first_bad_{n} < 0) {{ first_bad_{n} = i; first_got_{n} = got; first_exp_{n} = exp; }}
+}}
 """
+    return "".join(indent + line if line.strip() else line
+                   for line in body.splitlines(keepends=True))
 
 
 def _ok_expr(problem: Problem) -> str:
-    conds = [f"bad_{b.name} == 0" for b in problem.outputs]
+    """判「通过」的条件:每个稳定性重复都过 + 每个输出的数值都对 + 没有越界写。"""
+    conds = ["verify_pass == verify_repeat"]
+    conds += [f"bad_{b.name} == 0" for b in problem.outputs]
     conds += [f"gf_{b.name} == 0 && gb_{b.name} == 0" for b in problem.buffers]
-    return "(" + " && ".join(conds) + ")" if conds else "true"
+    return "(" + " && ".join(conds) + ")"
 
 
 def _bytes_moved_expr(problem: Problem) -> str:
@@ -249,14 +255,26 @@ static void leet_guard_check(const T* gdev, int64_t interior,
     for (int64_t i = 0; i < kGuardElems; ++i) if (hb[i] != sentinel) ++(*back_hits);
 }
 
-// 出错的统一出口:仍然打印 JSON,让上层能给出可读诊断
-static int leet_bail(const char* case_name, const char* stage, cudaError_t err) {
+// 出错的统一出口:打印一行错误 JSON。**不返回** —— 调用方在 lambda 里,
+// 用 LEET_FAIL 宏做 return。
+static void leet_bail(const char* case_name, const char* stage, cudaError_t err) {
     std::printf("%s{\\"case\\":\\"%s\\",\\"stage\\":\\"%s\\",\\"error_name\\":\\"%s\\","
                 "\\"error_str\\":\\"%s\\",\\"ok\\":false}\\n",
                 LEET_JSON, case_name, stage, cudaGetErrorName(err), cudaGetErrorString(err));
     std::fflush(stdout);
-    return 1;
 }
+
+// 出错即打印并跳出当前用例(用例体是 lambda,所以 return 是合法的)
+#define LEET_FAIL(stage, err) do { leet_bail(case_name, stage, err); return; } while (0)
+
+// device 缓冲的 RAII 包装:任何提前 return 都会释放,不会把显存漏给下一个用例
+struct LeetDev {
+    void* p = nullptr;
+    ~LeetDev() { if (p) cudaFree(p); }
+    LeetDev(const LeetDev&) = delete;
+    LeetDev& operator=(const LeetDev&) = delete;
+    LeetDev() = default;
+};
 
 // ------------------------------------------------------------------
 // L2 清空
@@ -274,11 +292,49 @@ __global__ void leet_flush_kernel(const int* __restrict__ buf, long long n, int*
 """
 
 
+def _cpp(template: str, **kw) -> str:
+    """填充 C++ 模板。
+
+    刻意用 @@X@@ 占位而不是 f-string:C++ 代码里全是花括号,在 f-string 里
+    要逐个写成 {{ }} —— 既难读又极易漏。占位符没有这个问题。
+    """
+    for key, val in kw.items():
+        template = template.replace(f"@@{key}@@", str(val))
+    return template
+
+
+def _indent_block(text: str, indent: str) -> str:
+    """给整段 C++ 加上缩进。
+
+    注意要保留末尾换行 —— splitlines() 会把它吃掉,导致后面拼上来的代码
+    被粘在同一行上(这个坑真实踩过:生成的代码里注释和语句连成了一行)。
+    """
+    out = "\n".join(indent + ln if ln.strip() else ln for ln in text.splitlines())
+    if text.endswith("\n"):
+        out += "\n"
+    return out
+
+
 def render_harness_cu(problem: Problem, impl_relpath: str = "impl.cu") -> str:
-    """生成 harness 的 main。impl_relpath 是相对本文件的实现文件路径。"""
+    """生成 harness 的 main。
+
+    **一个进程跑完所有用例**,而不是每个用例起一个进程。这不是微优化:
+    本机实测 CUDA 上下文初始化要 4.4 秒(空程序 `cudaFree(0)` 亦然),
+    而 kernel 本身往往只跑一百多微秒 —— 若每用例一个进程,进程启动开销会占掉
+    判题总时间的 90% 以上。所以:
+      * 默认跑全部用例(可用 --case <名字> 只跑一个,sanitizer 需要)
+      * 稳定性重复(--verify-repeat)也在进程内循环,而不是重复起进程
+      * L2 清空缓冲整个进程只分配一次
+
+    错误处理:每个用例体是一个 lambda,出错时打印错误 JSON 并 return,然后继续
+    下一个用例 —— 一个用例挂掉不该让其余用例的结果全部丢失。
+    """
     atol = problem.verify.atol
     rtol = problem.verify.rtol
     out_bufs = problem.outputs
+    poison_targets = out_bufs + problem.scratches
+    ind = "            "      # lambda 体内的缩进(12 空格)
+
     p: List[str] = [_GENERATED_HEADER]
     p.append(
         _HARNESS_PRELUDE.replace("@IMPL@", impl_relpath).replace("@MARKER@", JSON_MARKER)
@@ -300,265 +356,305 @@ def render_harness_cu(problem: Problem, impl_relpath: str = "impl.cu") -> str:
     ) + "\n};\n")
     p.append(f"static const int kNumCases = {len(problem.cases)};\n")
 
-    # ---- main 开头与参数解析 ----
-    p.append(f"""
-int main(int argc, char** argv) {{
-    if (argc < 2) {{
-        std::fprintf(stderr, "用法: %s <case> [--perf] [--warmup N] [--repeat N]\\n", argv[0]);
-        std::fprintf(stderr, "可用用例: ");
-        for (int i = 0; i < kNumCases; ++i) std::fprintf(stderr, "%s ", kCaseNames[i]);
-        std::fprintf(stderr, "\\n");
-        return 2;
-    }}
-    const char* case_name = argv[1];
+    # ---- main:参数解析 + 用例循环 + flush 缓冲 ----
+    p.append(_cpp("""
+int main(int argc, char** argv) {
+    const char* case_sel = "all";      // "all" = 跑全部用例
     bool do_perf = false;
-    int warmup = {problem.perf.warmup};
-    int perf_repeat = {problem.perf.repeat};
-    for (int i = 2; i < argc; ++i) {{
+    int warmup = @@WARMUP@@;
+    int perf_repeat = @@PERF_REPEAT@@;
+    int verify_repeat = @@VERIFY_REPEAT@@;
+    for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--perf")) do_perf = true;
+        else if (!std::strcmp(argv[i], "--case") && i + 1 < argc) case_sel = argv[++i];
         else if (!std::strcmp(argv[i], "--warmup") && i + 1 < argc) warmup = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--repeat") && i + 1 < argc) perf_repeat = std::atoi(argv[++i]);
-    }}
+        else if (!std::strcmp(argv[i], "--verify-repeat") && i + 1 < argc) verify_repeat = std::atoi(argv[++i]);
+        else if (argv[i][0] != '-') case_sel = argv[i];
+    }
 
-    const LeetParams* cp = nullptr;
-    for (int i = 0; i < kNumCases; ++i)
-        if (!std::strcmp(kCaseNames[i], case_name)) {{ cp = &kCases[i]; break; }}
-    if (!cp) {{ std::fprintf(stderr, "未知用例: %s\\n", case_name); return 2; }}
-    const LeetParams& C = *cp;
-""")
+    std::vector<int> todo;
+    for (int ci = 0; ci < kNumCases; ++ci)
+        if (!std::strcmp(case_sel, "all") || !std::strcmp(kCaseNames[ci], case_sel))
+            todo.push_back(ci);
+    if (todo.empty()) {
+        std::fprintf(stderr, "未知用例: %s(可用: all", case_sel);
+        for (int i = 0; i < kNumCases; ++i) std::fprintf(stderr, " %s", kCaseNames[i]);
+        std::fprintf(stderr, ")\\n");
+        return 2;
+    }
+
+    // 清 L2 的缓冲:整个进程只分配一次,所有用例复用
+    int* flush_buf = nullptr;
+    int* flush_sink = nullptr;
+    long long flush_ints = 0;
+    if (@@FLUSH@@) {
+        int l2_bytes = 0;
+        cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
+        if (l2_bytes <= 0) l2_bytes = 32 * 1024 * 1024;
+        flush_ints = (long long)((size_t)l2_bytes * 2 / sizeof(int));
+        if (cudaMalloc((void**)&flush_buf, (size_t)flush_ints * sizeof(int)) != cudaSuccess) {
+            flush_buf = nullptr;
+        } else if (cudaMemset(flush_buf, 1, (size_t)flush_ints * sizeof(int)) != cudaSuccess) {
+            cudaFree(flush_buf); flush_buf = nullptr;
+        } else if (cudaMalloc((void**)&flush_sink, sizeof(int)) != cudaSuccess) {
+            flush_sink = nullptr;
+        }
+    }
+    // 读满整个 flush 缓冲,用干净行把 L2 里的题目数据替换掉。
+    // 与用户 kernel 同流,天然串行;计时事件记录在其后,不计入开销。
+    auto leet_flush_l2 = [&]() {
+        if (flush_buf) leet_flush_kernel<<<1024, 256>>>(flush_buf, flush_ints, flush_sink);
+    };
+
+    for (int ci : todo) {
+        const char* case_name = kCaseNames[ci];
+        const LeetParams& C = kCases[ci];
+
+        // 单个用例的全部流程。包成 lambda 是为了能用 return 早退,
+        // 同时让 RAII(LeetDev / std::vector)负责释放 —— 不把显存漏给下一个用例。
+        auto leet_one_case = [&]() {
+""", WARMUP=problem.perf.warmup, PERF_REPEAT=problem.perf.repeat,
+        VERIFY_REPEAT=max(1, problem.verify.repeat),
+        FLUSH="true" if problem.perf.flush_l2 else "false"))
+
+    # 参数局部变量
     for prm in problem.params:
-        p.append(f"    {prm.ctype} {prm.name} = ({prm.ctype})C.{prm.name};\n")
+        p.append(f"{ind}{prm.ctype} {prm.name} = ({prm.ctype})C.{prm.name};\n")
 
-    # ---- host 缓冲 ----
-    p.append("\n    // ---------------- host 侧准备 ----------------\n")
+    # ---- host 缓冲(std::vector:免手动释放,早退也不漏) ----
+    p.append(f"\n{ind}// ---------------- host 侧准备 ----------------\n")
     for b in problem.buffers:
-        p.append(f"    int64_t leet_n_{b.name} = {b.count_expr()};\n")
+        p.append(f"{ind}int64_t leet_n_{b.name} = {b.count_expr()};\n")
     for b in problem.inputs + problem.scratches:
-        p.append(f"    {b.ctype}* h_{b.name} = ({b.ctype}*)std::malloc("
-                 f"sizeof({b.ctype}) * (size_t)leet_n_{b.name});\n")
+        p.append(f"{ind}std::vector<{b.ctype}> h_{b.name}((size_t)leet_n_{b.name});\n")
     for b in out_bufs:
-        # h_* 接收 device 回传的实际结果,e_* 放参考解的期望值
-        p.append(f"    {b.ctype}* h_{b.name} = ({b.ctype}*)std::malloc("
-                 f"sizeof({b.ctype}) * (size_t)leet_n_{b.name});\n")
-        p.append(f"    {b.ctype}* e_{b.name} = ({b.ctype}*)std::malloc("
-                 f"sizeof({b.ctype}) * (size_t)leet_n_{b.name});\n")
+        p.append(f"{ind}std::vector<{b.ctype}> h_{b.name}((size_t)leet_n_{b.name});\n")
+        p.append(f"{ind}std::vector<{b.ctype}> e_{b.name}((size_t)leet_n_{b.name});\n")
 
-    # 输入填充
     for i, b in enumerate(problem.inputs):
-        p.append(f"    {{ LeetRng rng(leet_seed_of(case_name) ^ {i + 1}ULL);\n"
-                 f"      for (int64_t j = 0; j < leet_n_{b.name}; ++j)"
+        p.append(f"{ind}{{ LeetRng rng(leet_seed_of(case_name) ^ {i + 1}ULL);\n"
+                 f"{ind}  for (int64_t j = 0; j < leet_n_{b.name}; ++j)"
                  f" h_{b.name}[j] = {_fill_expr(b)}; }}\n")
     for b in problem.scratches:
-        p.append(f"    std::memset(h_{b.name}, 0, sizeof({b.ctype}) * (size_t)leet_n_{b.name});\n")
+        p.append(f"{ind}std::memset(h_{b.name}.data(), 0,"
+                 f" sizeof({b.ctype}) * (size_t)leet_n_{b.name});\n")
     for b in out_bufs:
-        p.append(f"    std::memset(e_{b.name}, 0, sizeof({b.ctype}) * (size_t)leet_n_{b.name});\n")
+        p.append(f"{ind}std::memset(e_{b.name}.data(), 0,"
+                 f" sizeof({b.ctype}) * (size_t)leet_n_{b.name});\n")
 
     # ---- 参考解 ----
-    p.append("\n    // ---------------- 参考解(ground truth) ----------------\n")
-    p.append("    RefCtx rctx{};\n")
+    p.append(f"\n{ind}// ---------------- 参考解(ground truth) ----------------\n")
+    p.append(f"{ind}RefCtx rctx{{}};\n")
     for b in problem.inputs:
-        p.append(f"    rctx.{b.name} = h_{b.name};\n")
+        p.append(f"{ind}rctx.{b.name} = h_{b.name}.data();\n")
     for b in out_bufs:
-        p.append(f"    rctx.{b.name} = e_{b.name};\n")
+        p.append(f"{ind}rctx.{b.name} = e_{b.name}.data();\n")
     for prm in problem.params:
-        p.append(f"    rctx.{prm.name} = {prm.name};\n")
-    p.append("    reference(rctx);\n")
+        p.append(f"{ind}rctx.{prm.name} = {prm.name};\n")
+    p.append(f"{ind}reference(rctx);\n")
 
-    # ---- device 缓冲(带哨兵区) ----
-    p.append("\n    // ---------------- device 侧分配与上传(含哨兵区) ----------------\n")
+    # ---- device 缓冲(RAII + 哨兵区) ----
+    p.append(f"\n{ind}// ---------------- device 侧分配与上传(含哨兵区) ----------------\n")
     for b in problem.buffers:
-        ct = b.ctype
         p.append(
-            f"    {ct}* g_{b.name} = nullptr;   // 含前后哨兵区的完整分配\n"
-            f"    if (cudaMalloc((void**)&g_{b.name}, sizeof({ct}) *"
+            f"{ind}LeetDev g_{b.name};   // 含前后哨兵区的完整分配\n"
+            f"{ind}if (cudaMalloc(&g_{b.name}.p, sizeof({b.ctype}) *"
             f" (size_t)(leet_n_{b.name} + 2 * kGuardElems)) != cudaSuccess)"
-            f" return leet_bail(case_name, \"cudaMalloc({b.name})\", cudaGetLastError());\n"
-            f"    {ct}* d_{b.name} = g_{b.name} + kGuardElems;   // 交给 kernel 的内区\n"
+            f" LEET_FAIL(\"cudaMalloc({b.name})\", cudaGetLastError());\n"
+            f"{ind}{b.ctype}* d_{b.name} = ({b.ctype}*)g_{b.name}.p + kGuardElems;"
+            f"   // 交给 kernel 的内区\n"
         )
 
     for b in problem.inputs:
         ct = b.ctype
         p.append(
-            f"    {{ std::vector<{ct}> tmp((size_t)(leet_n_{b.name} + 2 * kGuardElems),"
+            f"{ind}{{ std::vector<{ct}> tmp((size_t)(leet_n_{b.name} + 2 * kGuardElems),"
             f" {_GUARD_CALL[b.dtype]});\n"
-            f"      std::memcpy(tmp.data() + kGuardElems, h_{b.name}, sizeof({ct}) * (size_t)leet_n_{b.name});\n"
-            f"      if (cudaMemcpy(g_{b.name}, tmp.data(), sizeof({ct}) *"
-            f" (size_t)(leet_n_{b.name} + 2 * kGuardElems), cudaMemcpyHostToDevice) != cudaSuccess)"
-            f" return leet_bail(case_name, \"H2D({b.name})\", cudaGetLastError()); }}\n"
+            f"{ind}  std::memcpy(tmp.data() + kGuardElems, h_{b.name}.data(),"
+            f" sizeof({ct}) * (size_t)leet_n_{b.name});\n"
+            f"{ind}  if (cudaMemcpy(g_{b.name}.p, tmp.data(), sizeof({ct}) *"
+            f" (size_t)(leet_n_{b.name} + 2 * kGuardElems), cudaMemcpyHostToDevice)"
+            f" != cudaSuccess) LEET_FAIL(\"H2D({b.name})\", cudaGetLastError()); }}\n"
         )
 
     # ---- LaunchCtx ----
-    p.append("\n    LaunchCtx lctx{};\n")
+    p.append(f"\n{ind}LaunchCtx lctx{{}};\n")
     for b in problem.buffers:
-        p.append(f"    lctx.{b.name} = d_{b.name};\n")
+        p.append(f"{ind}lctx.{b.name} = d_{b.name};\n")
     for prm in problem.params:
-        p.append(f"    lctx.{prm.name} = {prm.name};\n")
-    p.append("    lctx.stream = nullptr;\n")
+        p.append(f"{ind}lctx.{prm.name} = {prm.name};\n")
+    p.append(f"{ind}lctx.stream = nullptr;\n")
 
-    # ---- 毒化 + 一次干净执行 ----
-    p.append("\n    // ---------------- 正确性:一次干净的执行 ----------------\n")
-    p.append("    // out / scratch 填毒值,让「没写输出」表现为清一色的毒值\n")
-    for b in out_bufs + problem.scratches:
+    # ---- 统计量 ----
+    p.append(f"\n{ind}// ---------------- 统计量(跨稳定性重复累计/覆盖) ----------------\n")
+    for b in problem.buffers:
+        p.append(f"{ind}long long gf_{b.name} = 0, gb_{b.name} = 0;"
+                 f"   // 哨兵:任一次踩到都累加\n")
+    for b in out_bufs:
+        p.append(f"{ind}double max_abs_{b.name} = 0.0, max_rel_{b.name} = 0.0;\n")
+        p.append(f"{ind}long long bad_{b.name} = 0, first_bad_{b.name} = -1,"
+                 f" nan_{b.name} = 0, inf_{b.name} = 0;\n")
+        p.append(f"{ind}double first_got_{b.name} = std::nan(\"\"),"
+                 f" first_exp_{b.name} = std::nan(\"\");\n")
+    p.append(f"{ind}long long verify_pass = 0;\n")
+
+    # ---- 稳定性循环 ----
+    p.append(_indent_block("""
+// ---------------- 正确性:重复 @@N@@ 次 ----------------
+// 同一份输入反复跑,任何一次结果不对都算失败 —— 这是抓竞态 / 未初始化内存
+// 这类「有时对有时错」问题的基本手段。
+cudaEvent_t ev_a, ev_b;
+cudaEventCreate(&ev_a); cudaEventCreate(&ev_b);
+
+for (int vr = 0; vr < verify_repeat; ++vr) {
+    // out / scratch 填毒值:让「没写输出」表现为清一色的毒值
+""".replace("@@N@@", str(max(1, problem.verify.repeat))), ind))
+    for b in poison_targets:
         ct = b.ctype
         p.append(
-            f"    {{ std::vector<{ct}> tmp((size_t)(leet_n_{b.name} + 2 * kGuardElems),"
+            f"{ind}    {{ std::vector<{ct}> tmp((size_t)(leet_n_{b.name} + 2 * kGuardElems),"
             f" {_GUARD_CALL[b.dtype]});\n"
-            f"      for (int64_t j = 0; j < leet_n_{b.name}; ++j) tmp[kGuardElems + j] = {_POISON[b.dtype]};\n"
-            f"      cudaMemcpy(g_{b.name}, tmp.data(), sizeof({ct}) *"
+            f"{ind}      for (int64_t j = 0; j < leet_n_{b.name}; ++j)"
+            f" tmp[kGuardElems + j] = {_POISON[b.dtype]};\n"
+            f"{ind}      cudaMemcpy(g_{b.name}.p, tmp.data(), sizeof({ct}) *"
             f" (size_t)(leet_n_{b.name} + 2 * kGuardElems), cudaMemcpyHostToDevice); }}\n"
         )
-
-    p.append("""
-    (void)cudaGetLastError();          // 清空历史错误,避免误判成本次的
-    cudaEvent_t ev_a, ev_b;
-    cudaEventCreate(&ev_a); cudaEventCreate(&ev_b);
-
-    @LAUNCHER@(lctx);
-    cudaError_t e_launch = cudaGetLastError();
-    if (e_launch != cudaSuccess) return leet_bail(case_name, "launch", e_launch);
-    cudaError_t e_sync = cudaDeviceSynchronize();
-    if (e_sync != cudaSuccess) return leet_bail(case_name, "执行中(异步错误)", e_sync);
-""".replace("@LAUNCHER@", problem.launcher))
+    p.append(_indent_block("""
+(void)cudaGetLastError();      // 清空历史错误,避免误判成本次的
+@@LAUNCHER@@(lctx);
+cudaError_t e_launch = cudaGetLastError();
+if (e_launch != cudaSuccess) LEET_FAIL("launch", e_launch);
+cudaError_t e_sync = cudaDeviceSynchronize();
+if (e_sync != cudaSuccess) LEET_FAIL("执行中(异步错误)", e_sync);
+""".replace("@@LAUNCHER@@", problem.launcher), ind + "    "))
     for b in out_bufs:
-        p.append(f"    if (cudaMemcpy(h_{b.name}, d_{b.name}, sizeof({b.ctype}) * (size_t)leet_n_{b.name},"
-                 f" cudaMemcpyDeviceToHost) != cudaSuccess)"
-                 f" return leet_bail(case_name, \"D2H({b.name})\", cudaGetLastError());\n")
+        p.append(f"{ind}    if (cudaMemcpy(h_{b.name}.data(), d_{b.name},"
+                 f" sizeof({b.ctype}) * (size_t)leet_n_{b.name}, cudaMemcpyDeviceToHost)"
+                 f" != cudaSuccess) LEET_FAIL(\"D2H({b.name})\", cudaGetLastError());\n")
 
-    # ---- 哨兵检查 ----
-    p.append("\n    // ---------------- 哨兵检查(越界写) ----------------\n")
+    # 哨兵检查(跨重复累计)
+    p.append(f"\n{ind}    // 哨兵检查(越界写):跨重复累计\n")
     for b in problem.buffers:
-        p.append(f"    long long gf_{b.name} = 0, gb_{b.name} = 0;\n")
-        p.append(f"    leet_guard_check<{b.ctype}>(g_{b.name}, leet_n_{b.name},"
-                 f" &gf_{b.name}, &gb_{b.name});\n")
+        p.append(f"{ind}    {{ long long f = 0, b2 = 0;"
+                 f" leet_guard_check<{b.ctype}>((const {b.ctype}*)g_{b.name}.p,"
+                 f" leet_n_{b.name}, &f, &b2);"
+                 f" gf_{b.name} += f; gb_{b.name} += b2; }}\n")
 
-    # ---- 逐输出校验 ----
-    p.append("\n    // ---------------- 逐输出校验 ----------------\n")
+    # 逐输出比对(每轮重置)
+    p.append(f"\n{ind}    // 逐输出校验(最后一轮的结果会被报告出去)\n")
     for b in out_bufs:
-        p.append(f"""
-    double max_abs_{b.name} = 0.0, max_rel_{b.name} = 0.0;
-    long long bad_{b.name} = 0, first_bad_{b.name} = -1, nan_{b.name} = 0, inf_{b.name} = 0;
-    double first_got_{b.name} = std::nan(""), first_exp_{b.name} = std::nan("");
-    for (int64_t i = 0; i < leet_n_{b.name}; ++i) {{
-        double got = (double)h_{b.name}[i];
-        double exp = (double)e_{b.name}[i];
-{_compare_body(b, atol, rtol)}    }}
-""")
+        p.append(f"\n{ind}    max_abs_{b.name} = 0.0; max_rel_{b.name} = 0.0;\n"
+                 f"{ind}    bad_{b.name} = 0; first_bad_{b.name} = -1;"
+                 f" nan_{b.name} = 0; inf_{b.name} = 0;\n"
+                 f"{ind}    first_got_{b.name} = std::nan(\"\");"
+                 f" first_exp_{b.name} = std::nan(\"\");\n"
+                 f"{ind}    for (int64_t i = 0; i < leet_n_{b.name}; ++i) {{\n"
+                 f"{ind}        double got = (double)h_{b.name}[i];\n"
+                 f"{ind}        double exp = (double)e_{b.name}[i];\n"
+                 + _compare_body(b, atol, rtol, indent=ind + "        ")
+                 + f"{ind}    }}\n")
+
+    pass_cond = " && ".join(f"bad_{b.name} == 0" for b in out_bufs) or "true"
+    guard_cond = " && ".join(f"gf_{b.name} == 0 && gb_{b.name} == 0"
+                             for b in problem.buffers) or "true"
+    p.append(f"{ind}    if (({pass_cond}) && ({guard_cond})) ++verify_pass;\n"
+             f"{ind}}}\n")
 
     # ---- 性能 ----
-    p.append(f"""
-    // ---------------- 性能 ----------------
-    double median_ms = -1.0, min_ms = -1.0, gb_per_s = -1.0;
-    double bytes_moved = (double)({_bytes_moved_expr(problem)});
-    if (do_perf) {{
-        // 清 L2:读一遍大于 L2 的缓冲,把题目数据挤出缓存。
-        // 不这样做的话,几 MB 的题目会整个驻留 L2(4090 有 72MB),
-        // 测出来的是缓存带宽而不是显存带宽,数字严重失真。
-        int* flush_buf = nullptr;
-        int* flush_sink = nullptr;
-        long long flush_ints = 0;
-        if ({'true' if problem.perf.flush_l2 else 'false'}) {{
-            int l2_bytes = 0;
-            cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
-            if (l2_bytes <= 0) l2_bytes = 32 * 1024 * 1024;
-            // 2×L2 确保把题目数据彻底挤出去
-            flush_ints = (long long)((size_t)l2_bytes * 2 / sizeof(int));
-            if (cudaMalloc((void**)&flush_buf, (size_t)flush_ints * sizeof(int)) != cudaSuccess) {{
-                flush_buf = nullptr;
-            }} else if (cudaMemset(flush_buf, 1, (size_t)flush_ints * sizeof(int)) != cudaSuccess) {{
-                cudaFree(flush_buf); flush_buf = nullptr;
-            }} else if (cudaMalloc((void**)&flush_sink, sizeof(int)) != cudaSuccess) {{
-                flush_sink = nullptr;
-            }}
-        }}
-        // 读满整个 flush 缓冲,用干净行把 L2 里的题目数据替换掉。
-        // 与用户 kernel 同流,天然串行;计时事件记录在其后,不计入开销。
-        auto leet_flush_l2 = [&]() {{
-            if (!flush_buf) return;
-            int blocks = 1024;
-            leet_flush_kernel<<<blocks, 256>>>(flush_buf, flush_ints, flush_sink);
-        }};
+    p.append(_indent_block("""
+// ---------------- 性能 ----------------
+double median_ms = -1.0, min_ms = -1.0, gb_per_s = -1.0;
+double bytes_moved = (double)(@@BYTES@@);
+if (do_perf) {
+    for (int i = 0; i < warmup; ++i) {
+        leet_flush_l2();
+        @@LAUNCHER@@(lctx);
+    }
+    cudaError_t e_warm = cudaDeviceSynchronize();
+    if (e_warm != cudaSuccess) LEET_FAIL("预热", e_warm);
 
-        for (int i = 0; i < warmup; ++i) {{
-            leet_flush_l2();
-            {problem.launcher}(lctx);
-        }}
-        cudaError_t e_warm = cudaDeviceSynchronize();
-        if (e_warm != cudaSuccess) return leet_bail(case_name, "预热", e_warm);
-
-        std::vector<double> ts;
-        ts.reserve((size_t)perf_repeat);
-        for (int i = 0; i < perf_repeat; ++i) {{
-            leet_flush_l2();                                        // 计时区外
-            cudaEventRecord(ev_a, nullptr);
-            {problem.launcher}(lctx);
-            cudaEventRecord(ev_b, nullptr);
-            cudaEventSynchronize(ev_b);
-            float ms = 0.f;
-            cudaEventElapsedTime(&ms, ev_a, ev_b);
-            cudaError_t e_t = cudaGetLastError();
-            if (e_t != cudaSuccess) return leet_bail(case_name, "计时循环", e_t);
-            ts.push_back((double)ms);
-        }}
-        std::sort(ts.begin(), ts.end());
-        min_ms = ts.front();
-        median_ms = ts[ts.size() / 2];
-        if (median_ms > 0.0) gb_per_s = bytes_moved / median_ms * 1e-6;
-        if (flush_buf) cudaFree(flush_buf);
-        if (flush_sink) cudaFree(flush_sink);
-    }}
-    cudaEventDestroy(ev_a); cudaEventDestroy(ev_b);
-""")
+    std::vector<double> ts;
+    ts.reserve((size_t)perf_repeat);
+    for (int i = 0; i < perf_repeat; ++i) {
+        leet_flush_l2();                    // 计时区外
+        cudaEventRecord(ev_a, nullptr);
+        @@LAUNCHER@@(lctx);
+        cudaEventRecord(ev_b, nullptr);
+        cudaEventSynchronize(ev_b);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, ev_a, ev_b);
+        cudaError_t e_t = cudaGetLastError();
+        if (e_t != cudaSuccess) LEET_FAIL("计时循环", e_t);
+        ts.push_back((double)ms);
+    }
+    std::sort(ts.begin(), ts.end());
+    min_ms = ts.front();
+    median_ms = ts[ts.size() / 2];
+    if (median_ms > 0.0) gb_per_s = bytes_moved / median_ms * 1e-6;
+}
+""".replace("@@BYTES@@", _bytes_moved_expr(problem))
+   .replace("@@LAUNCHER@@", problem.launcher), ind))
 
     # ---- 输出 JSON ----
-    p.append("\n    // ---------------- 结果(单行 JSON,前缀标记便于解析) ----------------\n")
-    p.append('    std::printf("%s{", LEET_JSON);\n')
-    p.append('    std::printf("\\"case\\":\\"%s\\"", case_name);\n')
-    p.append('    std::printf(",\\"params\\":{");\n')
+    p.append(f"\n{ind}// ---------------- 结果(单行 JSON,前缀标记便于解析) ----------------\n")
+    p.append(f'{ind}std::printf("%s{{", LEET_JSON);\n')
+    p.append(f'{ind}std::printf("\\"case\\":\\"%s\\"", case_name);\n')
+    p.append(f'{ind}std::printf(",\\"params\\":{{");\n')
     for i, prm in enumerate(problem.params):
         comma = "" if i == 0 else ", "
-        p.append(f'    std::printf("{comma}\\"{prm.name}\\":");'
+        p.append(f'{ind}std::printf("{comma}\\"{prm.name}\\":");'
                  f' {{ char nb[64]; leet_jnum(nb, sizeof(nb), (double){prm.name});'
                  f' std::printf("%s", nb); }}\n')
-    p.append('    std::printf("}");\n')
-    p.append('    std::printf(",\\"outputs\\":[");\n')
+    p.append(f'{ind}std::printf("}}");\n')
+    p.append(f'{ind}std::printf(",\\"outputs\\":[");\n')
     for i, b in enumerate(out_bufs):
         comma = "" if i == 0 else ", "
-        p.append(f"""
-    {{
-        char nb[64];
-        std::printf("{comma}{{\\"name\\":\\"{b.name}\\",\\"count\\":%lld,\\"bad\\":%lld,",
-                    (long long)leet_n_{b.name}, bad_{b.name});
-        std::printf("\\"max_abs_err\\":%.9g,\\"max_rel_err\\":%.9g,", max_abs_{b.name}, max_rel_{b.name});
-        std::printf("\\"first_bad_idx\\":%lld,", first_bad_{b.name});
-        leet_jnum(nb, sizeof(nb), first_got_{b.name}); std::printf("\\"first_got\\":%s,", nb);
-        leet_jnum(nb, sizeof(nb), first_exp_{b.name}); std::printf("\\"first_exp\\":%s,", nb);
-        std::printf("\\"nan_count\\":%lld,\\"inf_count\\":%lld}}", nan_{b.name}, inf_{b.name});
-    }}
-""")
-    p.append('    std::printf("]");\n')
-    p.append('    std::printf(",\\"guards\\":{");\n')
+        p.append(_indent_block("""
+{
+    char nb[64];
+    std::printf("@@COMMA@@{\\"name\\":\\"@@NAME@@\\",\\"count\\":%lld,\\"bad\\":%lld,",
+                (long long)leet_n_@@NAME@@, bad_@@NAME@@);
+    std::printf("\\"max_abs_err\\":%.9g,\\"max_rel_err\\":%.9g,",
+                max_abs_@@NAME@@, max_rel_@@NAME@@);
+    std::printf("\\"first_bad_idx\\":%lld,", first_bad_@@NAME@@);
+    leet_jnum(nb, sizeof(nb), first_got_@@NAME@@);
+    std::printf("\\"first_got\\":%s,", nb);
+    leet_jnum(nb, sizeof(nb), first_exp_@@NAME@@);
+    std::printf("\\"first_exp\\":%s,", nb);
+    std::printf("\\"nan_count\\":%lld,\\"inf_count\\":%lld}", nan_@@NAME@@, inf_@@NAME@@);
+}
+""".replace("@@NAME@@", b.name).replace("@@COMMA@@", comma), ind))
+    p.append(f'{ind}std::printf("]");\n')
+    p.append(f'{ind}std::printf(",\\"guards\\":{{");\n')
     for i, b in enumerate(problem.buffers):
         comma = "" if i == 0 else ", "
-        p.append(f'    std::printf("{comma}\\"{b.name}\\":{{\\"front\\":%lld,\\"back\\":%lld}}",'
+        p.append(f'{ind}std::printf("{comma}\\"{b.name}\\":{{\\"front\\":%lld,\\"back\\":%lld}}",'
                  f' gf_{b.name}, gb_{b.name});\n')
-    p.append('    std::printf("}");\n')
-    p.append(f'    std::printf(",\\"ok\\":%s", ({_ok_expr(problem)}) ? "true" : "false");\n')
-    p.append('    if (do_perf) std::printf(",\\"perf\\":{\\"median_ms\\":%.6f,\\"min_ms\\":%.6f,'
-             '\\"runs\\":%d,\\"warmup\\":%d,\\"bytes_moved\\":%.0f,\\"gb_per_s\\":%.3f}",'
-             ' median_ms, min_ms, perf_repeat, warmup, bytes_moved, gb_per_s);\n')
-    p.append('    std::printf("}\\n");\n')
-    p.append("    std::fflush(stdout);\n")
+    p.append(f'{ind}std::printf("}}");\n')
+    p.append(f'{ind}std::printf(",\\"verify_pass\\":%lld", verify_pass);\n')
+    p.append(f'{ind}std::printf(",\\"verify_total\\":%d", verify_repeat);\n')
+    p.append(f'{ind}std::printf(",\\"ok\\":%s", ({_ok_expr(problem)}) ? "true" : "false");\n')
+    p.append(_indent_block("""
+if (do_perf) std::printf(",\\"perf\\":{\\"median_ms\\":%.6f,\\"min_ms\\":%.6f,"
+                         "\\"runs\\":%d,\\"warmup\\":%d,\\"bytes_moved\\":%.0f,"
+                         "\\"gb_per_s\\":%.3f}",
+                         median_ms, min_ms, perf_repeat, warmup, bytes_moved, gb_per_s);
+std::printf("}\\n");
+std::fflush(stdout);
+""", ind))
 
-    # ---- 收尾 ----
-    p.append("\n    // ---------------- 释放 ----------------\n")
-    for b in problem.buffers:
-        p.append(f"    cudaFree(g_{b.name});\n")
-    for b in problem.inputs + problem.scratches + out_bufs:
-        p.append(f"    std::free(h_{b.name});\n")
-    for b in out_bufs:
-        p.append(f"    std::free(e_{b.name});\n")
-    p.append("    return 0;\n}\n")
+    p.append(_indent_block("""
+cudaEventDestroy(ev_a); cudaEventDestroy(ev_b);
+};   // leet_one_case
+leet_one_case();
+    }
 
+    if (flush_buf) cudaFree(flush_buf);
+    if (flush_sink) cudaFree(flush_sink);
+    return 0;
+}
+""", ind[:4]))
     return "".join(p)
 
 
