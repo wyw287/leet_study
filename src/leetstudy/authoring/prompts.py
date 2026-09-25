@@ -364,13 +364,17 @@ def _blocks(subject: str):
 
 
 def build_author_prompt(requirement: str, root: Path, subject: str = "cuda",
-                        example_id: str = "", existing_ids: List[str] = None) -> str:
+                        example_id: str = "", existing_ids: List[str] = None,
+                        only_one: bool = False) -> str:
     """组装出题用的完整提示词。
 
     直接把题库里一道已通过验证的题完整读进来当范例 —— 这样提示词与真实的
     spec 格式永远同步,不会因为文档漂移而生成出格式过时的题目。
 
     范例文件按科目取:PyTorch 题没有 template.cu 之类。
+
+    only_one=True 时明确要求「本次只出一道具」。用于 `leet new --count N` ——
+    那里是逐道开独立会话,不能让每个会话都去尝试出完全部 N 道。
     """
     schema, requirements, workflow = _blocks(subject)
     example_id = example_id or DEFAULT_EXAMPLE.get(subject, "01-vector-add")
@@ -399,6 +403,16 @@ def build_author_prompt(requirement: str, root: Path, subject: str = "cuda",
         "**本批题目属于 `cuda` 科目** —— 学习者写 kernel 与启动配置。"
     )
 
+    # `leet new --count N` 是逐道开独立会话的。学习者的需求原文里往往写着
+    # 「出三道…」,如果不明确约束,每个会话都会去尝试出完全部 N 道 ——
+    # 既浪费,又会撞超时。
+    scope_line = (
+        "\n**本次只出一道具。** 上面的需求里可能提到多道题,那是 `leet new --count`\n"
+        "按道拆开、一道一个会话执行的 —— 你这次**只负责其中一道**,不要试图把\n"
+        "全部题目一次做完。\n"
+        if only_one else ""
+    )
+
     return f"""你是一位 CUDA / PyTorch 教学专家,正在为一个「LeetCode 式的刷题框架」出题。
 
 # 学习者的需求
@@ -412,6 +426,7 @@ def build_author_prompt(requirement: str, root: Path, subject: str = "cuda",
 在 `problems/<新题id>/` 目录下产出 5 个文件:spec.yaml / problem.md / template /
 reference / baseline(扩展名随科目:PyTorch 是 `.py`,CUDA 是 `.cu` / `.cpp`)。
 id 用小写短横线风格并带序号前缀。
+{scope_line}
 
 {schema}
 {requirements}

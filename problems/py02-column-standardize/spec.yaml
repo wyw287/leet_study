@@ -1,0 +1,65 @@
+id: py02-column-standardize
+title: 列方向标准化
+subject: pytorch
+difficulty: 3
+tags: [fused-kernel, memory-traffic, pytorch, reduction, elementwise]
+concepts:
+  - 一行 eager PyTorch 代码就是一个(或几个)GPU 内核,每个内核都要把整个张量读/写一遍
+  - 先数「访存遍数」,再去找能把遍数压下来的算子组合
+  - 中间张量(居中后的 x、均值、方差)被物化的真实代价
+  - 融合内核只在自己擅长的布局上才真的融合
+
+# x 与 out 都是 rows×cols、按行连续(row-major)的 f32 张量
+buffers:
+  - {name: x,   dtype: f32, shape: [rows, cols], role: in}
+  - {name: out, dtype: f32, shape: [rows, cols], role: out}
+params:
+  - {name: rows, dtype: i32}
+  - {name: cols, dtype: i32}
+  - {name: eps,  dtype: f32}          # 数值稳定项,本题固定 1.0e-5
+
+entry:
+  function: forward
+
+cases:
+  # 8192² × 4B = 268MB。朴素实现要在这块数据上走 4 遍读 + 2 遍写(1.61GB),
+  # 实测基线 1.71ms —— 远高于计时器分辨率,可评级。
+  - {name: square, params: {rows: 8192,  cols: 8192, eps: 1.0e-5}}
+  # 同样 268MB,但归约维(rows)长 4 倍、输出列少 4 倍:
+  # 归约那几步的访存模式更极端,是这道题的形状敏感点。
+  - {name: tall,   params: {rows: 32768, cols: 2048, eps: 1.0e-5}}
+  # 质数规模、比一个 warp 还小:考边界与形状退化。
+  # 有偏/无偏的差别在这里是 2.8%(rows=8192 时只有 1.2e-4),
+  # 所以它是唯一能抓住「方差定义写错」的用例。
+  # 同时它是最小用例 —— 模板与劣化解的区分度检查只跑它。
+  - {name: tiny,   params: {rows: 37,    cols: 53,   eps: 1.0e-5}}
+
+verify:
+  # 参考解在 CPU 上用 float64 计算。f32 归约与 f64 的差异在 |out|~1 的量级
+  # 上约 1e-6,这里留了一个数量级余量;但**没有**宽到放过无偏方差(见上)。
+  atol: 1e-5
+  rtol: 1e-4
+  repeat: 3
+
+perf:
+  bound: memory
+  metric: speedup
+  repeat: 30
+  warmup: 5
+  # 门槛由实测倒推(square,8192²;单位「遍」= 268MB 走一遍显存)。
+  # 访存效率不是瓶颈:基线 6 遍 = 1.61GB / 1.71ms = 941 GB/s = 峰值的 93%,
+  # 所以加速比几乎就等于**遍数之比**(6/5、6/4、6/3),实测吻合到 1% 以内:
+  #   基线 mean+var+sub+div            6 遍   1.71ms   1.00x
+  #   var_mean + (x-mu)/sqrt(...)      5 遍   1.43ms   1.21x
+  #   mean + var + addcmul             4 遍   1.14ms   1.51x
+  #   var_mean + addcmul               3 遍   0.85ms   2.02x  ← 纯 PyTorch 上限
+  #   x.t() + layer_norm + .t()        4 遍 + 物理转置   2.27ms   0.76x  ← 反而更慢
+  # 3 遍是纯 PyTorch 的下限(2 遍要有跨 block 协作的内核,得自己写 CUDA)。
+  # S=1.8 是上限 2.02x 的 ~89%,对 3 遍写法留 12% 余量。
+  grades: {B: 1.15, A: 1.45, S: 1.8}
+
+sanitize:
+  # 纯 PyTorch 题:没有自定义 CUDA kernel,memcheck 只会拖慢而无所得。
+  # (如果学习者自己用 load_inline 写了自定义算子在解答里,那是解答侧的事,
+  #  题目本身不需要为此打开全局 memcheck。)
+  memcheck: false

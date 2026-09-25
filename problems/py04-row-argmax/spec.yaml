@@ -1,0 +1,75 @@
+id: py04-row-argmax
+title: 逐行 argmax(分类预测)
+subject: pytorch
+difficulty: 2
+tags: [argmax, sort, memory-access-pattern, pytorch, reduction]
+concepts:
+  - 排序/置换类算子的代价:数据被搬好几遍,而且一半是**散写**(打不满带宽)
+  - 归约类算子只读一遍、顺序读,直接跑在带宽天花板上
+  - 「我要位置,所以得先排序」是一个常见但昂贵的直觉
+  - 同一个问题的不同 API(sort / topk / argmax / max)代价差一个数量级,选之前先算字节
+
+# x 是 rows×cols、按行连续(row-major)的 f32 张量;out 是每行的 argmax 列下标
+buffers:
+  - {name: x,   dtype: f32, shape: [rows, cols], role: in}
+  - {name: out, dtype: i32, shape: [rows],       role: out}
+params:
+  - {name: rows, dtype: i32}
+  - {name: cols, dtype: i32}
+
+entry:
+  function: forward
+
+cases:
+  # 134MB。实测(通过框架):基线 1.72ms、正解 0.147ms → 11.69x,
+  # 远高于计时器分辨率,可评级。两者读的是**同一份数据**、算出的是**同一个答案**,
+  # 差别只在访存模式。
+  - {name: square, params: {rows: 8192,  cols: 4096}}
+  # 同样 134MB,但行更长、行数更少。这一格是本题的天花板:**排序被行长度拖垮**
+  # (基线 6.46ms,只有 20 GB/s),而归约的耗时与形状无关(0.146ms,和 square 一样)——
+  # 于是同一个正解在这里拿到 44.27x。
+  # 它同时说明「多趟置换」的代价会随每段的长度恶化,而流式读不会。
+  - {name: tall,   params: {rows: 2048,  cols: 16384}}
+  # 行数、列数都是质数(6151 / 2053):考非 2 的幂、不整除任何分块大小的边界。
+  # 数据量小一些(50MB),基线 0.81ms、正解 0.063ms → 12.79x。
+  - {name: odd,    params: {rows: 6151,  cols: 2053}}
+  # 最小的用例:37×53,比一个 warp 还小。两个写法都在 10µs 上下,测的是启动开销
+  # 而不是访存 —— 所以它不参与评级(框架会自动跳过它)。
+  # 它同时是「模板必须失败 / 劣化解必须失败」两项区分度检查唯一会跑的用例。
+  - {name: tiny,   params: {rows: 37,    cols: 53}}
+
+verify:
+  # 这道题的答案(下标)是**精确**的:argmax 不涉及任何浮点累加,最大值本身就是
+  # 输入里的某个 f32。实测基线与参考解的 max_err = 0,正解也是 0。
+  # 容差只用来兜住「并列」这种规则层面的分歧(见 problem.md)。
+  atol: 1e-5
+  rtol: 1e-4
+  repeat: 3
+
+perf:
+  bound: memory
+  metric: speedup
+  repeat: 30
+  warmup: 5
+  # 134MB,远大于 72MB L2;不清缓存会测到缓存带宽。
+  flush_l2: true
+  # 门槛由实测倒推(单位:相对基线的加速比,评级取各用例的最大值)。
+  # 实测的阶梯非常干净 —— 四条路读的是同一份数据、给出同一个答案:
+  #   全排序 argsort(基线)                        1.00x      C
+  #   topk(1):不再需要完整顺序,但仍然在做「选择」  8.19x      B
+  #   两遍读:先求 max,再回头 == 找位置            15.18x      A
+  #   一遍归约 max(dim=1) / argmax                44.27x      S   ← 天花板
+  # 天花板就是「把 134MB 读一遍」的物理下限(tall 上 0.146ms;同一份数据上
+  # sum(dim=1) 也是 0.145ms,归约贴着带宽墙跑)。因此 44x 不是运气,
+  # 而是带宽墙除以排序的浪费倍数。三档都卡在实测的空隙里:
+  #   B=3.0 —— 只要不再依赖全排序就能拿到(topk 最低一档 3.57x 也过);
+  #   A=10  —— 必须把「选择」也去掉,但读两遍仍然只能到这(15.18x 高它 1.5 倍,
+  #            而 topk 最高 8.19x 低它 18%);
+  #   S=25  —— 必须一遍读完(天花板 44.27x,留了 1.77 倍余量;
+  #            读两遍那档最高 15.18x,低它 39%)。
+  grades: {B: 3.0, A: 10.0, S: 25.0}
+
+sanitize:
+  # 纯 PyTorch 题:没有自定义 CUDA kernel,memcheck 只会拖慢而无所得。
+  # (如果学习者自己用 load_inline 写了自定义算子在解答里,那是解答侧的事。)
+  memcheck: false

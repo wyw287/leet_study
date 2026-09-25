@@ -36,6 +36,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..spec import Buffer, Problem, load_problem
 from .base import JSON_MARKER
 
+# 别往题目目录里写 __pycache__。
+# 下面用 importlib 加载 template.py / reference.py / baseline.py,默认行为会在
+# problems/<id>/ 下留下字节码缓存 —— 那是版本管理的源码目录,不该被运行时产物污染。
+# (缓存本身无害且可重建,但看着脏,而且会让人以为那是什么重要文件。)
+sys.dont_write_bytecode = True
+
 # 哨兵区元素个数,与 CUDA 侧保持一致
 GUARD_ELEMS = 4096
 

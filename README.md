@@ -89,8 +89,8 @@ $EDITOR solutions/01-vector-add/solution.cu
 | `leet start <题号> [--force]` | 从模板生成解答文件 |
 | `leet test [题号] [--case C] [--no-sanitize] [--race] [--gpu N] [-v]` | **主命令**:编译 + 判分 |
 | `leet bench [题号] [--repeat N]` | 只测性能,重复更多次 |
-| `leet review [题号]` | 让本地 claude 讲评你的 kernel |
-| `leet new "<需求>" [--subject pytorch]` | 让本地 claude 自动出题(含自验证与修复回路) |
+| `leet review [题号] [--fresh]` | 让本地 claude 讲评你的 kernel |
+| `leet new "<需求>" [--subject pytorch] [--count N]` | 让本地 claude 自动出题(含自验证与修复回路) |
 | `leet validate [--all\|<题号>]` | 题库健康检查 |
 | `leet stats` | 学习进度看板 |
 | `leet clean` | 清理编译产物 |
@@ -121,6 +121,28 @@ leet test         # 改了再跑,还是不用敲
 
 > `leet` 装在项目内 venv 里,**不在 PATH 上**。嫌麻烦就加个别名:
 > `echo "alias leet='<仓库路径>/.venv/bin/leet'" >> ~/.bashrc`
+
+### `review` 会复用上次 `test` 的结果
+
+`leet test` 会把判题结果存进 `build/<题号>/last_verdict.json`。如果之后跑
+`leet review`,而**解答、题目的 spec、参考解、基线都没变**,就直接复用那份数据,
+省掉一次判题(实测 11.3 s → 4.5 s,省下的时间在 claude 那几分钟面前不算大,
+但至少不用白等一次 CUDA 上下文初始化):
+
+```
+$ leet review
+复用上次 test 的结果(2 分钟前;解答自那之后没改过)—— 想重新判题就加 --fresh
+```
+
+想强制重测加 `--fresh`。判据是**内容哈希**而不是文件修改时间 —— `touch`、
+`git checkout`、编辑器无改动保存都会动 mtime,但那些情况下缓存依然有效。
+
+**`test` 绝不复用缓存。** `review` 把判题数据当作"给模型的上下文",略有陈旧无伤大雅;
+而 `test` 的数据是用来**评级**的 —— 复用就等于把成绩变成"上次测的时候机器忙不忙"
+的产物。同一个理由也让本框架拒绝了缓存基线耗时(`docs/design.md` 第六节)。
+
+选项也必须一致:如果缓存那次是 `leet test --no-sanitize`(没做内存检查),
+而 `leet review` 想要消毒报告,就会重测一遍。
 
 ## 耗时参考
 
@@ -198,12 +220,23 @@ baseline.cu ──→ 同一个 harness 再编译一次 ──────→ �
 ### 全自动出题
 
 ```bash
-leet new "出两道关于 bank conflict 的题,难度递进"
+leet new "出一道关于 bank conflict 的题"
+leet new --count 3 "关于 bank conflict 的题,难度递进"
+leet new --subject pytorch "出一道 LayerNorm 的题"
 ```
 
 本地 claude 会读完 spec 格式说明 + 一道已通过的范例,自己写文件、编译、跑
 `leet validate` 迭代。完成之后**框架再独立验证一遍**(不采信它的自我声明),
 不过关就把失败报告回喂给它修,最多若干轮。
+
+**`--count N` 是逐道开独立会话**,不是让一次会话出 N 道 —— 一道要 25~40 分钟,
+塞进一次会话会撞超时。逐道开还有两个好处:每道题的上下文是干净的,而且
+前一道的产出会自动进入后一道的「不要重复出这些」列表。跑完会分类汇总哪几道可用:
+
+```
+✓ 可用:2 道  06-bank-conflict, 07-shared-reduce
+✗ 需处理:1 道  08-bad-example
+```
 
 出题者的工具权限走白名单(`Read/Write/Edit/Glob/Grep` + `leet`/`nvcc`/
 `compute-sanitizer` 三个命令),不使用 `--dangerously-skip-permissions`。
