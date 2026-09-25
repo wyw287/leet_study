@@ -1,12 +1,19 @@
-# leet_study —— LeetCode 式的 CUDA 刷题框架
+# leet_study —— LeetCode 式的编程刷题框架
 
-把 CUDA 练习变成刷题:你只写 **kernel** 和**启动配置**,剩下的全部自动完成。
+把一个知识点拆成一道道有判分的题,让你只写**核心的那几行**,剩下的自动完成。
+
+目前支持两个科目:
+
+| 科目 | 你写什么 | 题号前缀 |
+|---|---|---|
+| **CUDA** | kernel + 启动配置(数据分配/搬运/计时/对拍/越界检查全自动) | `01-` `02-` … |
+| **PyTorch** | 一个 `forward(ctx)`(用 torch 算子,或写自定义 CUDA 算子) | `py01-` … |
 
 ```
 $ leet test 01
 题目 01-vector-add  向量加法
 难度 ●○○○○   标签 elementwise memory-bound
-──────────────────────────────────────────────────────────────
+──────────────────────────────────────────────
 编译    ✓  nvcc -O3 -lineinfo  2.4s
 正确性
           exact          n=16777216  ✓  max_err 0
@@ -58,23 +65,59 @@ $EDITOR solutions/01-vector-add/solution.cu
 
 代码是能直接改的教科书:`solutions/` 下是你的工作区,`problems/` 下是题目定义。
 
+## 文档地图
+
+| 你想… | 看这个 |
+|---|---|
+| **做题** | 本文件 + 题面(`leet show <题号>`) |
+| **出一道具(或改题)** | [`docs/authoring.md`](docs/authoring.md) |
+| **理解为什么这样设计** | [`docs/design.md`](docs/design.md) |
+| **遇到报错 / 装不上** | [`docs/troubleshooting.md`](docs/troubleshooting.md) |
+| **让 AI 助手接着改这个项目** | [`CLAUDE.md`](CLAUDE.md) |
+| **改配置** | [`config.yaml.example`](config.yaml.example) |
+
+`docs/design.md` 里全是实测数字(`nvidia-smi` 4.3 秒、L2 脏行把带宽从 1024 压到
+512 GB/s 这类),想知道「为什么这么做」的时候翻它。
+
 ## 命令
 
 | 命令 | 作用 |
 |---|---|
-| `leet doctor` | 环境自检 |
+| `leet doctor` | 环境自检(nvcc / GPU / sanitizer / claude / torch / ninja / venv) |
 | `leet list [--tag T] [--diff N] [--status todo\|done]` | 题库浏览 + 完成状态 |
 | `leet show <题号>` | 读题面 |
-| `leet start <题号>` | 从模板生成解答文件 |
+| `leet start <题号> [--force]` | 从模板生成解答文件 |
 | `leet test <题号> [--case C] [--no-sanitize] [--race] [--gpu N] [-v]` | **主命令**:编译 + 判分 |
 | `leet bench <题号> [--repeat N]` | 只测性能,重复更多次 |
 | `leet review <题号>` | 让本地 claude 讲评你的 kernel |
-| `leet new "<需求>"` | 让本地 claude 自动出题(含自验证与修复回路) |
+| `leet new "<需求>" [--subject pytorch]` | 让本地 claude 自动出题(含自验证与修复回路) |
 | `leet validate [--all\|<题号>]` | 题库健康检查 |
 | `leet stats` | 学习进度看板 |
 | `leet clean` | 清理编译产物 |
 
 题号支持 `1` / `01` / `vector` 这类宽松写法。
+
+> `leet` 装在项目内 venv 里,**不在 PATH 上**。嫌麻烦就加个别名:
+> `echo "alias leet='<仓库路径>/.venv/bin/leet'" >> ~/.bashrc`
+
+## 耗时参考
+
+| 命令 | 典型耗时 |
+|---|---|
+| `leet list` / `show` / `stats` | ~0.2 s |
+| `leet test`(首次或改了源码) | ~14–21 s(2 次 nvcc 编译 + 3 个 CUDA 进程) |
+| `leet test`(源码未变,编译缓存命中) | ~11 s |
+| `leet validate <题号>` | 实测:CUDA 题 ~40 s;PyTorch 题 ~85 s(原因见下) |
+| `leet validate --all` | 实测 ~4.7 分钟(6 道题)—— 改框架后应当跑它 |
+| `leet new` | 20–40 分钟 |
+
+> **为什么 PyTorch 题的 validate 反而比 CUDA 题慢**(85s vs 40s),尽管它不需要编译?
+> 因为区分度检查要跑 **6 个变体**(基线 + 模板 + 4 个劣化解),每个都是一次独立的
+> Python 进程 —— 要 import torch(1.6 s),并在 CPU 上以 float64 重算一遍参考解
+> (8192×8192 的 softmax,五遍 67M 元素的运算)。
+> CUDA 侧只有 2 个变体跑完整用例,且一个 harness 进程能跑完所有用例。
+> 教训:**「不需要编译」不等于「快」** —— 成本会转移到进程启动、库导入和重算 oracle 上。
+> 详见 [`docs/design.md`](docs/design.md) 第六节末尾。
 
 ## 工作原理
 
@@ -192,12 +235,23 @@ def forward(ctx):
 `Artifact` 是不透明句柄 —— CUDA 下是编译出的可执行文件,PyTorch 下就是 `.py` 源码
 本身。Triton 只需复用 PyTorch 科目的 runner(Triton 的 JIT 对框架透明)。
 
+完整的接口契约、`CaseResult.raw` 的 JSON 结构、以及可选方法的语义,
+见 [`docs/design.md`](docs/design.md) 第七节。
+
 ## 目录结构
 
 ```
+README.md          本文件:是什么、怎么用
+CLAUDE.md          给 AI 助手的项目约定(用什么命令、哪些设计不能改)
+docs/
+  design.md        设计决策与理由 —— 为什么这样实现(带实测数字)
+  authoring.md     出题指南:文件契约、spec 字段参考、定门槛的方法
+  troubleshooting.md  排错手册:症状 → 原因 → 处理
+config.yaml.example  配置样例(全部字段可选,改哪项取消注释即可)
+src/leetstudy/     框架代码(各模块头部有说明)
 problems/<id>/
-  spec.yaml       机器可读定义:科目、接口契约、用例、容差、评分门槛
-  problem.md      中文题面:讲解 + 提示 + 陷阱 + 思考题
+  spec.yaml        机器可读定义:科目、接口契约、用例、容差、评分门槛
+  problem.md       中文题面:讲解 + 提示 + 陷阱 + 思考题
   template.cu     ┐
   reference.cpp   ├ CUDA 科目的四个文件(由 spec.subject 决定实际用哪套)
   baseline.cu     │
@@ -206,25 +260,40 @@ problems/<id>/
   reference.py    ├ PyTorch 科目的三个文件
   baseline.py     ┘
 solutions/<id>/
-  solution.cu     你的解答(扩展名随科目)
-build/            编译产物(可 leet clean 清掉)
+  solution.cu      你的解答(扩展名随科目)
+build/             编译产物(可 leet clean 清掉)
 ```
+
+### 想读代码
+
+按这个顺序读最省力:
+
+1. `problems/01-vector-add/spec.yaml` —— 先看一道题长什么样
+2. `src/leetstudy/spec.py` —— 数据模型(字段的权威定义)
+3. `src/leetstudy/subjects/base.py` —— 科目接口与 `Artifact` 抽象
+4. `src/leetstudy/codegen.py` —— 生成的 harness 长什么样(头部注释说明了设计)
+5. `src/leetstudy/judge.py` —— 编排:准备 → 跑用例 → 计时 → 消毒 → 诊断 → 评级
 
 ## 配置
 
-`config.yaml`(可选,放仓库根)或环境变量:
+复制 [`config.yaml.example`](config.yaml.example) 成 `config.yaml` 即可 ——
+**所有字段都是可选的**,默认值就是「自动」,改哪项取消哪项的注释。
+临时改动用环境变量(全部带 `LEETSTUDY_` 前缀)更方便。
+
+优先级:配置文件 < 环境变量 < 命令行参数。
 
 | 配置项 | 环境变量 | 说明 |
 |---|---|---|
-| `arch` | `LEETSTUDY_ARCH` | 目标架构,默认按本机 GPU 自动探测 |
-| `gpu` | `LEETSTUDY_GPU` | 指定物理 GPU 序号 |
+| `arch` | `LEETSTUDY_ARCH` | 目标架构。**默认惰性探测** —— 只有真要编译时才跑 nvidia-smi |
+| `gpu` | `LEETSTUDY_GPU` | 指定物理 GPU。留空则自动挑最闲的 |
 | `nvcc` / `sanitizer` / `claude_bin` | `LEETSTUDY_NVCC` 等 | 工具路径 |
 | `claude_model` | `LEETSTUDY_CLAUDE_MODEL` | 出题/讲评用的模型。**默认不指定**,继承你当前的 claude 配置 |
-| `peak_bandwidth_gbps` | `LEETSTUDY_PEAK_BANDWIDTH_GBPS` | 覆盖峰值带宽(默认按 GPU 名称查表) |
-| `claude_allowed_tools` | — | 出题者的工具白名单 |
-| `author_timeout` | `LEETSTUDY_AUTHOR_TIMEOUT` | 单次出题超时(秒) |
+| `peak_bandwidth_gbps` | `LEETSTUDY_PEAK_BANDWIDTH_GBPS` | 覆盖峰值带宽(默认按 GPU 名称查内置表) |
+| `claude_allowed_tools` | — | 出题者的工具白名单(默认只放开读写 + leet/nvcc/sanitizer) |
+| `compile_timeout` / `run_timeout` / `sanitizer_timeout` / `author_timeout` | 同名大写 | 各类超时(秒) |
 
 多卡机器上,框架默认自动挑**最空闲**的一张;若已设置 `CUDA_VISIBLE_DEVICES` 则不干预。
+**同一次判题内 GPU 选择是固定的** —— 所有用例必须落在同一张卡上,加速比才可比。
 
 ## 已知限制
 
@@ -233,10 +302,18 @@ build/            编译产物(可 leet clean 清掉)
   不影响相对比较,`leet test` 会在出现时注明。
 - **单用例耗时的可评级下限是 20µs**。更小的用例会被跳过评级(仍参与正确性判定),
   因为那个量级上测的是启动开销和计时器抖动。
-- **只支持 CUDA**。判题层留了 `Subject` 协议(`src/leetstudy/subjects/base.py`),
-  将来接 Triton / PyTorch 只需新增一个 adapter。
+- **这台机器上起 CUDA 进程很贵**:CUDA 上下文初始化实测 4.4 秒(空程序亦然),
+  `nvidia-smi` 单次 4.3 秒。框架已经据此做了缓存与进程合并(`leet test` 从 49 秒
+  降到 11–21 秒),但**任何新增的「每个用例起一个进程」路径都会立刻退化**。
+  详见 [`docs/design.md`](docs/design.md) 第六节。
+- **只支持 `cuda` 与 `pytorch` 两个科目**。判题层已经抽象好了
+  (`subjects/base.py` 的 `Subject` 基类 + `Artifact` 句柄),加 Triton 只需复用
+  PyTorch 科目的 runner。见 [`docs/design.md`](docs/design.md) 第七节。
 - **`--race`(racecheck)很慢**,只在小用例上跑。默认只在检测到「同一输入重复跑
   结果不一致」这个竞态特征时才自动触发。
+- **PyTorch 科目没有哨兵区**(除非解答选择写进 `ctx.out`)。纯 PyTorch 算子不可能
+  越界写用户张量,所以这个损失可接受;需要越界诊断的场景用 `ctx.out` 写法,
+  框架会照常检查。
 
 ## 关于题库来源
 

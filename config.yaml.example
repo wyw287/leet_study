@@ -1,0 +1,73 @@
+# leetstudy 配置文件(全部字段都是可选的)
+#
+# 用法:复制成 config.yaml 放在仓库根目录。
+#     cp config.yaml.example config.yaml
+#
+# 优先级:本文件 < 环境变量(LEETSTUDY_*) < 命令行参数
+# 所以临时改动用环境变量更方便,长期设置写在这里。
+#
+# 本文件里所有值都写成注释,因为默认值就是「自动」—— 取消注释才会生效。
+
+# ---------------------------------------------------------------------------
+# 工具路径
+# ---------------------------------------------------------------------------
+# 留空则从 PATH 里找。只有工具装在非标准位置时才需要写。
+#
+# nvcc: /usr/local/cuda/bin/nvcc           # 或 LEETSTUDY_NVCC
+# sanitizer: /usr/local/cuda/bin/compute-sanitizer   # 或 LEETSTUDY_SANITIZER
+# claude_bin: claude                       # 或 LEETSTUDY_CLAUDE_BIN
+#
+# 含 / 的路径会按仓库根解析(相对路径)或直接使用(绝对路径)。
+
+# ---------------------------------------------------------------------------
+# GPU
+# ---------------------------------------------------------------------------
+# 目标架构。留空则自动探测 —— 且是**惰性**的:只有真要编译/跑题时才探测,
+# 因为这台机器上 nvidia-smi 单次要 4.3 秒,而 list/show/start 根本不需要它。
+#
+# arch: sm_89                               # 或 LEETSTUDY_ARCH
+#
+# 指定物理 GPU 序号。留空时:若已设 CUDA_VISIBLE_DEVICES 则尊重之;
+# 否则自动挑(利用率, 已用显存)最小的那张。多卡共享机器上很有用。
+#
+# gpu: 3                                    # 或 LEETSTUDY_GPU
+
+# 峰值带宽(GB/s),用于把实测 GB/s 换算成「占峰值百分比」。
+# 留空则按 GPU 名称查内置表(覆盖 4090/3090/A100/H100/L40S/T4 等)。
+# 换了不认识的卡、或想用自己的实测值时才需要写。
+#
+# peak_bandwidth_gbps: 1008                 # 或 LEETSTUDY_PEAK_BANDWIDTH_GBPS
+
+# ---------------------------------------------------------------------------
+# 超时(秒)
+# ---------------------------------------------------------------------------
+# compile_timeout: 180                      # 单次 nvcc 编译;或 LEETSTUDY_COMPILE_TIMEOUT
+# run_timeout: 120                          # 单个用例执行;PyTorch 科目取 max(此值, 300)
+# sanitizer_timeout: 600                    # compute-sanitizer;或 LEETSTUDY_SANITIZER_TIMEOUT
+# author_timeout: 3600                      # 单次 leet new/review;或 LEETSTUDY_AUTHOR_TIMEOUT
+
+# ---------------------------------------------------------------------------
+# 出题与讲评(leet new / leet review)
+# ---------------------------------------------------------------------------
+# 模型名。**默认留空 = 继承你当前的 claude 配置。**
+# 本机 claude 是自定义模型接入,写具体模型名(如 haiku)会报 unrecognized_model。
+#
+# claude_model:                            # 或 LEETSTUDY_CLAUDE_MODEL
+#
+# 出题者可以用的工具。默认白名单:读写文件 + leet/nvcc/compute-sanitizer 三个命令。
+# 想收紧或放宽时覆盖整份列表。
+#
+# claude_allowed_tools:
+#   - Read
+#   - Write
+#   - Edit
+#   - Glob
+#   - Grep
+#   - "Bash(leet:*)"
+#   - "Bash(.venv/bin/leet:*)"
+#   - "Bash(nvcc:*)"
+#   - "Bash(compute-sanitizer:*)"
+#
+# 追加给 claude CLI 的额外参数(会原样拼到命令行上)。
+#
+# claude_extra_args: []
