@@ -50,20 +50,46 @@ _STAGE_HINTS = {
 }
 
 
-def describe_cuda_error(stage: Optional[str], name: Optional[str], text: Optional[str]) -> List[str]:
-    """把一个 CUDA 运行时错误翻译成人话。"""
+def describe_runtime_error(stage: Optional[str], name: Optional[str],
+                           text: Optional[str]) -> List[str]:
+    """把一次运行期错误翻译成人话。
+
+    错误名有两种来源:CUDA 运行时(如 cudaErrorIllegalAddress),
+    或解释型语言的异常类名(如 RuntimeError / ValueError)。
+    """
     if not name:
         return []
     out: List[str] = []
     where = _STAGE_HINTS.get(stage or "", "")
-    out.append(f"CUDA 错误 {name}:{text}('{where or '执行期间'}')")
-    hint = CUDA_ERROR_HINTS.get(name)
-    if hint:
-        out.append(hint)
-    if name in ("cudaErrorIllegalAddress", "cudaErrorMisalignedAddress",
-                "cudaErrorUnspecifiedLaunchFailure"):
-        out.append("跑一次 `leet test <题号> --sanitize` 可以拿到出错的具体行号。")
+
+    if name.startswith("cudaError"):
+        out.append(f"CUDA 错误 {name}:{text}('{where or '执行期间'}')")
+        hint = CUDA_ERROR_HINTS.get(name)
+        if hint:
+            out.append(hint)
+        if name in ("cudaErrorIllegalAddress", "cudaErrorMisalignedAddress",
+                    "cudaErrorUnspecifiedLaunchFailure"):
+            out.append("跑一次 `leet test <题号> --race` 可以拿到出错的具体行号。")
+        return out
+
+    # 非 CUDA 错误:解释型语言的异常
+    out.append(f"{where or '执行'}时抛出了 {name}:{text}")
+    if name in ("SyntaxError", "IndentationError"):
+        out.append("这是语法错误,检查缩进与括号匹配。")
+    elif name == "AttributeError":
+        out.append("属性不存在。检查你是否拼错了 ctx 上的字段名 —— "
+                   "可用字段见题面或 template 顶部的注释。")
+    elif name in ("TypeError", "ValueError"):
+        out.append("参数类型/取值不对。检查张量的 dtype 与形状是否与题面一致。")
+    elif name == "IndexError":
+        out.append("下标越界。检查张量的维度与索引范围。")
+    elif name == "NotImplementedError":
+        out.append("还有没实现的部分 —— 是不是某个 TODO 忘了填?")
     return out
+
+
+# 兼容旧名
+describe_cuda_error = describe_runtime_error
 
 
 def describe_outputs(problem: Problem, result: CaseResult, case_name: str = "") -> List[str]:
@@ -198,15 +224,27 @@ _RE_SYNCTHREADS = re.compile(r"__syncthreads\s*\(")
 _RE_LAUNCH = re.compile(r"<<<")
 
 
-def source_hints(src: str) -> List[str]:
-    """对用户源码做轻量静态扫描,给出提示。"""
+def source_hints(src: str, subject: str = "cuda") -> List[str]:
+    """对用户源码做轻量静态扫描,给出提示。
+
+    提示是**科目相关**的:CUDA 关心有没有启动 kernel、有没有漏同步;
+    PyTorch 关心有没有同步点、有没有把张量当 Python 对象逐个处理。
+    这些都不影响判分,只作教学提醒。
+    """
 
     def strip_comments(text: str) -> str:
         text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
         text = re.sub(r"//[^\n]*", "", text)
+        text = re.sub(r"#[^\n]*", "", text)
         return text
 
     code = strip_comments(src)
+    if subject == "pytorch":
+        return _pytorch_source_hints(code)
+    return _cuda_source_hints(code)
+
+
+def _cuda_source_hints(code: str) -> List[str]:
     hints: List[str] = []
 
     if _RE_CUDA_MALLOC.search(code):
@@ -232,6 +270,35 @@ def source_hints(src: str) -> List[str]:
         )
     if not _RE_LAUNCH.search(code):
         hints.append("源码里没有找到 <<< >>> 启动语法,launcher 似乎没有真正启动 kernel。")
+    return hints
+
+
+# PyTorch 侧的高频性能陷阱:同步点、逐元素 Python 循环
+_RE_TORCH_SYNC = re.compile(r"torch\.cuda\.synchronize\s*\(|\.item\s*\(\s*\)|\.cpu\s*\(\s*\)|\.numpy\s*\(\s*\)")
+_RE_TORCH_LOOP = re.compile(r"for\s+\w+\s+in\s+range\s*\(\s*\w+\.(shape|size)")
+_RE_CTX_REBIND = re.compile(r"\bctx\s*\.\s*\w+\s*=")
+
+
+def _pytorch_source_hints(code: str) -> List[str]:
+    hints: List[str] = []
+
+    if _RE_TORCH_SYNC.search(code):
+        hints.append(
+            "检测到 .item() / .cpu() / .numpy() 或 torch.cuda.synchronize()。"
+            "它们会强制同步 —— GPU 的异步流水会被打断,而且这段等待会被计入计时。"
+            "如果要读取某个值来决定下一步,想清楚能不能用张量算子表达。"
+        )
+    if _RE_TORCH_LOOP.search(code):
+        hints.append(
+            "检测到对张量形状做 Python 层 for 循环。每个假设的「元素」在这里其实"
+            "都是一次独立的内核启动(几十微秒起),而一次算子调用只启动一个内核。"
+            "尽量把操作表达成整张量的算子。"
+        )
+    if _RE_CTX_REBIND.search(code):
+        hints.append(
+            "检测到 `ctx.<字段> = ` 形式的赋值。如果你把 ctx.out 指向了新张量,"
+            "框架就看不到你的结果了 —— 请写进 ctx.out 本身,或者直接 return 张量。"
+        )
     return hints
 
 

@@ -3,20 +3,23 @@
 一道题最容易出的问题不是「参考解写错了」(那会让基线对拍失败,容易发现),
 而是**测试太弱**:随便写点什么都能过。这种题做起来毫无意义,而且很难靠人眼发现。
 
-做法:注入一组**必然错误**的实现 —— 空实现、全填 0、全填 1、只写每块的首元素 ——
+做法:注入一组**必然错误**的实现 —— 空实现、全填 0、全填 1、只写首元素 ——
 要求每一个都被判为失败。任意一个竟然通过了,就说明这道题的测试形同虚设,必须打回。
 
-这组劣化解都是**从 spec 泛化生成**的(只需要知道有哪些 out 缓冲),所以对任何题目
-都适用,不需要针对算法写特例。这正是这个检查能用于全自动出题的原因。
+这组劣化解由**科目自己提供**(`Subject.mutants`),因为它们与语言强相关:
+CUDA 版是写 `<kernel><<<...>>>`,PyTorch 版是 `ctx.out.fill_(0)`。
+但两边都遵循同一条原则:**从 spec 泛化生成,只需要知道有哪些 out 缓冲**,
+与具体算法无关 —— 这正是这个检查能用于全自动出题的原因。
 """
 from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from .. import subjects
 from ..config import Config
-from ..spec import DTYPES, Problem, missing_files
-from ..subjects.cuda import CudaSubject
+from ..spec import Problem, missing_files
+from ..subjects.base import Subject
 
 # 一道题的基线耗时合理区间(毫秒)。
 # 太快 → 用例太小,cudaEvent 的分辨率(~0.5µs)会主导测量,数字不可信;
@@ -24,94 +27,44 @@ from ..subjects.cuda import CudaSubject
 MIN_BASELINE_MS = 0.02
 MAX_BASELINE_MS = 5000.0
 
+MIN_STATEMENT_CHARS = 600
+MIN_STATEMENT_HEADINGS = 2
+
 Check = Tuple[str, bool, str]
-
-
-# --------------------------------------------------------------------------- #
-# 劣化解生成
-# --------------------------------------------------------------------------- #
-
-_MUTANT_KINDS = ("noop", "zeros", "ones", "first_only")
-
-_MUTANT_DOC = {
-    "noop": "空实现(什么都不做)—— 必须被抓到,否则漏写输出也能过",
-    "zeros": "把输出全填 0 —— 若这也能过,说明期望值恰好是 0,测试退化",
-    "ones": "把输出全填 1 —— 若这也能过,说明期望值是常数,测试退化",
-    "first_only": "只写每块输出的第 0 个元素 —— 若这也能过,说明只检查了首元素",
-}
-
-
-def render_mutant(problem: Problem, kind: str) -> str:
-    """按 spec 泛化生成一份必然错误的实现(只需定义 launcher)。"""
-    lines: List[str] = [
-        "// 自动生成的劣化解 —— 用于区分度检查,不该出现在题目目录里。\n",
-        f"// 类型:{kind} —— {_MUTANT_DOC[kind]}\n",
-        '#include "ctx.h"\n\n',
-    ]
-
-    if kind == "noop":
-        lines.append(
-            f"void {problem.launcher}(LaunchCtx& ctx) {{\n"
-            "    (void)ctx;   // 什么都不做\n"
-            "}\n"
-        )
-        return "".join(lines)
-
-    # 后三种都用「填充 kernel」实现
-    fill_ops: List[str] = []
-    for b in problem.outputs:
-        ct = b.ctype
-        kname = f"leet_mut_fill_{b.name}"
-        lines.append(
-            f"__global__ void {kname}({ct}* buf, long long n, {ct} v) {{\n"
-            f"    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;\n"
-            f"    long long stride = (long long)gridDim.x * blockDim.x;\n"
-            f"    for (; i < n; i += stride) buf[i] = v;\n"
-            f"}}\n\n"
-        )
-        count = f"leet_mut_n_{b.name}"
-        if kind == "first_only":
-            # 只写首元素:仍用同一个 kernel,但只覆盖 n=1
-            fill_ops.append(
-                f"    long long {count} = 1;   // 故意只覆盖首元素\n"
-                f"    {kname}<<<1, 1>>>(ctx.{b.name}, {count}, "
-                f"({ct}){'1' if b.dtype in ('f32', 'f64') else '1'});\n"
-            )
-        else:
-            value = "0" if kind == "zeros" else "1"
-            cast = f"({ct}){value}"
-            fill_ops.append(
-                f"    long long {count} = {b.count_expr(prefix='ctx.')};\n"
-                f"    {kname}<<<(unsigned)(({count} + 255) / 256), 256>>>"
-                f"(ctx.{b.name}, {count}, {cast});\n"
-            )
-
-    lines.append(f"void {problem.launcher}(LaunchCtx& ctx) {{\n")
-    lines.extend(fill_ops)
-    lines.append("}\n")
-    return "".join(lines)
 
 
 # --------------------------------------------------------------------------- #
 # 验证
 # --------------------------------------------------------------------------- #
 
-MIN_STATEMENT_CHARS = 600
-MIN_STATEMENT_HEADINGS = 2
-
-
 def validate_problem(cfg: Config, problem: Problem) -> List[Check]:
     """对一道题做全套检查,返回 [(检查项, 是否通过, 说明)]。"""
-    subject = CudaSubject(cfg)
-    build_root = cfg.build_dir_for(problem.id)
     checks: List[Check] = []
 
+    # ---- 0. 科目可用 ----
+    if not subjects.is_registered(problem.subject):
+        return [("科目已注册", False,
+                 f"subject={problem.subject!r} 未知;已注册:{', '.join(subjects.available())}")]
+    subject = subjects.get(problem.subject, cfg)
+    build_root = cfg.build_dir_for(problem.id)
+
+    # ---- 0b. entry 键齐备(科目自己声明要哪些) ----
+    need = subjects.required_entry_keys(problem.subject)
+    absent = [k for k in need if k not in problem.entry]
+    if absent:
+        return [("entry 声明齐备", False,
+                 f"{problem.subject} 科目要求 entry 里有 {list(need)};"
+                 f"缺少 {absent}(当前:{sorted(problem.entry)})")]
+    checks.append(("entry 声明齐备", True,
+                   ", ".join(f"{k}={problem.entry[k]}" for k in need)))
+
     # ---- 1. 文件齐备 ----
-    missing = missing_files(problem)
+    missing = missing_files(problem, subject.required_filenames())
     if missing:
         checks.append(("文件齐备", False, "缺少:" + ", ".join(missing)))
         return checks  # 缺文件后面的都做不了
-    checks.append(("文件齐备", True, "spec / 题面 / 模板 / 参考解 / 基线 齐全"))
+    checks.append(("文件齐备", True,
+                   "spec / 题面 / " + " / ".join(subject.required_filenames()) + " 齐全"))
 
     # ---- 1b. 题面得有实质内容 ----
     #   只看文件存在是不够的:自动出题很容易留下一个占位符桩文件,
@@ -133,24 +86,24 @@ def validate_problem(cfg: Config, problem: Problem) -> List[Check]:
         checks.append(("题面有实质内容", True,
                        f"{len(statement)} 字符,{headings} 个章节"))
 
-    # ---- 2. 编译基线 ----
-    baseline_build = subject.compile_variant(
-        problem, problem.root / "baseline.cu", build_root, "baseline"
+    # ---- 2. 准备基线 ----
+    baseline_build = subject.prepare_variant(
+        problem, problem.root / subject.baseline_filename, build_root, "baseline"
     )
     if not baseline_build.ok:
         first = baseline_build.log.splitlines()[:3]
-        checks.append(("编译基线", False, " / ".join(first)))
+        checks.append(("准备基线", False, " / ".join(first)))
         return checks
-    checks.append(("编译基线", True, f"{baseline_build.seconds:.1f}s"))
+    checks.append(("准备基线", True, f"{baseline_build.seconds:.1f}s"))
 
     # ---- 3. 基线通过对拍 ----
     #   参考解本身是「标准答案」,没法自己验自己。但基线是一份独立写出来的朴素
-    #   CUDA 实现 —— 如果它和参考解在每个用例上都一致,两边同时写错的可能性极低。
+    #   实现 —— 如果它和参考解在每个用例上都一致,两边同时写错的可能性极低。
     #   这是差分测试:用两个独立实现互相印证。
     bad_cases: List[str] = []
     baseline_ms: dict = {}
     for case in problem.cases:
-        r = subject.run_case(baseline_build.exe, case.name, perf=problem.perf.enabled)
+        r = subject.run_case(baseline_build.artifact, case.name, perf=problem.perf.enabled)
         if not r.ok:
             why = r.error_name or "结果不匹配"
             bad_cases.append(f"{case.name}({why})")
@@ -190,17 +143,19 @@ def validate_problem(cfg: Config, problem: Problem) -> List[Check]:
     else:
         checks.append(("性能地板", True, "本题未开启性能评分,跳过"))
 
-    # ---- 5. 劣化解必须被判失败(区分度检查)----
-    positive_control = _template_check(subject, problem, build_root)
-    checks.append(positive_control)
-
-    for kind in _MUTANT_KINDS:
+    # ---- 5. 模板与劣化解必须被判失败(区分度检查)----
+    checks.append(_template_check(subject, problem, build_root))
+    for kind in subject.mutants(problem):
         checks.append(_mutant_check(subject, problem, build_root, kind))
 
     return checks
 
 
-def _run_cases(subject: CudaSubject, exe: Path, problem: Problem,
+def _solution_ext(subject: Subject) -> str:
+    return Path(subject.solution_filename).suffix or ".txt"
+
+
+def _run_cases(subject: Subject, artifact, problem: Problem,
                cases=None) -> Tuple[bool, str]:
     """跑若干用例,返回 (是否全部通过, 说明)。
 
@@ -211,7 +166,7 @@ def _run_cases(subject: CudaSubject, exe: Path, problem: Problem,
     targets = problem.cases if cases is None else list(cases)
     passed: List[str] = []
     for case in targets:
-        r = subject.run_case(exe, case.name, perf=False)
+        r = subject.run_case(artifact, case.name, perf=False)
         if r.ok:
             passed.append(case.name)
     if not passed:
@@ -219,32 +174,38 @@ def _run_cases(subject: CudaSubject, exe: Path, problem: Problem,
     return True, f"竟然通过了这些用例:{', '.join(passed)}"
 
 
-def _template_check(subject: CudaSubject, problem: Problem, build_root: Path) -> Check:
+def _template_check(subject: Subject, problem: Problem, build_root: Path) -> Check:
     name = "模板必须失败"
-    build = subject.compile_variant(
-        problem, problem.root / "template.cu", build_root, "chk_template"
+    build = subject.prepare_variant(
+        problem, problem.root / subject.template_filename, build_root, "chk_template"
     )
     if not build.ok:
-        # 模板编译不过也算「失败」,但更可能是模板本身有语法问题,标出来
-        return (name, True, "模板编译不通过(当作失败处理,但建议检查模板语法)")
-    ok, detail = _run_cases(subject, build.exe, problem, [problem.smallest_case])
+        # 模板准备失败也算「失败」,但更可能是模板本身有语法问题,标出来
+        return (name, True, "模板无法通过准备阶段(当作失败处理,但建议检查模板语法)")
+    ok, detail = _run_cases(subject, build.artifact, problem, [problem.smallest_case])
     if ok:
         return (name, False, f"⚠️ 空模板竟然能通过 —— {detail}。这道题在放水!")
     return (name, True, "模板被判失败,符合预期")
 
 
-def _mutant_check(subject: CudaSubject, problem: Problem, build_root: Path,
+def _mutant_check(subject: Subject, problem: Problem, build_root: Path,
                   kind: str) -> Check:
     name = f"劣化解必须失败:{kind}"
-    src = build_root / "mutants" / f"{kind}.cu"
-    src.parent.mkdir(parents=True, exist_ok=True)
-    src.write_text(render_mutant(problem, kind), encoding="utf-8")
+    source = subject.mutants(problem).get(kind)
+    if source is None:
+        return (name, False, "科目没有提供这个劣化解")
 
-    build = subject.compile_variant(problem, src, build_root, f"chk_{kind}")
+    src = build_root / "mutants" / f"{kind}{_solution_ext(subject)}"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text(source, encoding="utf-8")
+
+    build = subject.prepare_variant(problem, src, build_root, f"chk_{kind}")
     if not build.ok:
         return (name, False,
-                "劣化解编译失败,无法完成检查:" + " / ".join(build.log.splitlines()[:2]))
-    ok, detail = _run_cases(subject, build.exe, problem, [problem.smallest_case])
+                "劣化解无法通过准备阶段,检查无法完成:"
+                + " / ".join(build.log.splitlines()[:2]))
+    ok, detail = _run_cases(subject, build.artifact, problem, [problem.smallest_case])
     if ok:
-        return (name, False, f"⚠️ {_MUTANT_DOC[kind]} —— 但它通过了。{detail}")
+        doc = subject.mutant_docs.get(kind, kind)
+        return (name, False, f"⚠️ {doc} —— 但它通过了。{detail}")
     return (name, True, "被判失败,符合预期")

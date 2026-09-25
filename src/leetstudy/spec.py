@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
@@ -84,6 +84,26 @@ class Buffer:
 
     def describe(self) -> str:
         return f"{self.name}: {self.dtype}[{', '.join(self.shape) or '标量'}] ({self.role})"
+
+    def resolve_shape(self, params: Dict[str, float]) -> List[int]:
+        """把形状表达式求出具体维度。形状项要么是参数名,要么是整数字面量。
+
+        解释型科目(PyTorch)直接用这个建张量;C 侧走 count_expr 生成表达式。
+        """
+        dims: List[int] = []
+        for dim in self.shape:
+            if dim in params:
+                dims.append(int(params[dim]))
+            else:
+                dims.append(int(dim))
+        return dims
+
+    def count(self, params: Dict[str, float]) -> int:
+        """元素总数。标量(shape 为空)返回 1。"""
+        total = 1
+        for d in self.resolve_shape(params):
+            total *= d
+        return total
 
 
 @dataclass(frozen=True)
@@ -173,12 +193,33 @@ class Problem:
     buffers: List[Buffer]
     params: List[Param]
     cases: List[Case]
-    kernel: str
-    launcher: str
+    #: 判题科目(cuda / pytorch / …)。决定由哪个 Subject 来编译与运行。
+    subject: str
+    #: 入口声明。各科目自己决定要哪些键:
+    #:   cuda    → {kernel: __global__ 函数名, launcher: host 端启动函数名}
+    #:   pytorch → {function: 被调用的 Python 函数名}
+    entry: Dict[str, str]
     verify: Verify
     perf: Perf
     sanitize: Sanitize
     root: Path
+
+    # -- 入口(向后兼容的便捷属性) ------------------------------------------ #
+
+    @property
+    def kernel(self) -> str:
+        """CUDA 科目用:__global__ 函数名。"""
+        return self.entry.get("kernel", "")
+
+    @property
+    def launcher(self) -> str:
+        """CUDA 科目用:host 端启动函数名。"""
+        return self.entry.get("launcher", "")
+
+    @property
+    def function(self) -> str:
+        """解释型科目用:被调用的 Python 函数名。"""
+        return self.entry.get("function", "")
 
     # -- 便捷视图 ---------------------------------------------------------- #
 
@@ -327,12 +368,23 @@ def parse_problem(raw: Dict[str, Any], root: Path) -> Problem:
     if not any(b.role == "out" for b in buffers):
         raise SpecError("spec 至少要有一个 role=out 的 buffer,否则无从判分")
 
-    entry = _need(raw, "entry", "spec")
-    kernel = str(_need(entry, "kernel", "entry"))
-    launcher = str(_need(entry, "launcher", "entry"))
-    for label, val in (("entry.kernel", kernel), ("entry.launcher", launcher)):
-        if not _IDENT.match(val):
-            raise SpecError(f"{label}={val!r} 不是合法的 C 标识符")
+    # 科目:决定由谁来编译与运行。默认 cuda,让既有题目无需改动。
+    subject = str(raw.get("subject") or "cuda").strip().lower()
+    if not _SLUG.match(subject):
+        raise SpecError(f"subject={subject!r} 不是合法标识")
+
+    # 入口声明按科目自解释:这里只做通用校验(必须是 标识符 → 标识符 的映射),
+    # 具体要哪些键由对应 Subject 检查(见 subjects/*.py 的 required_entry_keys)。
+    raw_entry = _need(raw, "entry", "spec")
+    if not isinstance(raw_entry, dict) or not raw_entry:
+        raise SpecError("entry 应为非空映射,如 {kernel: foo, launcher: foo_launch}")
+    entry: Dict[str, str] = {}
+    for key, val in raw_entry.items():
+        if not _IDENT.match(str(key)):
+            raise SpecError(f"entry 的键 {key!r} 不是合法标识符")
+        if not _IDENT.match(str(val)):
+            raise SpecError(f"entry.{key}={val!r} 不是合法标识符")
+        entry[str(key)] = str(val)
 
     raw_cases = raw.get("cases") or []
     if not raw_cases:
@@ -423,8 +475,8 @@ def parse_problem(raw: Dict[str, Any], root: Path) -> Problem:
         buffers=buffers,
         params=params,
         cases=cases,
-        kernel=kernel,
-        launcher=launcher,
+        subject=subject,
+        entry=entry,
         verify=verify,
         perf=perf,
         sanitize=sanitize,
@@ -432,8 +484,9 @@ def parse_problem(raw: Dict[str, Any], root: Path) -> Problem:
     )
 
 
-def load_problem(problem_dir: Path) -> Problem:
-    """从题目目录加载 spec.yaml。"""
+def load_problem(problem_dir) -> Problem:
+    """从题目目录加载 spec.yaml。接受 Path 或字符串。"""
+    problem_dir = Path(problem_dir)
     spec_path = problem_dir / "spec.yaml"
     if not spec_path.is_file():
         raise SpecError(f"找不到 {spec_path}")
@@ -444,16 +497,15 @@ def load_problem(problem_dir: Path) -> Problem:
     return parse_problem(raw, problem_dir)
 
 
-def required_files(problem: Problem) -> List[str]:
-    """一道题必须齐备的文件(P0-1 的模板由 `leet start` 复制到用户工作区)。"""
-    return [
-        problem.statement,
-        "spec.yaml",
-        "template.cu",
-        "reference.cpp",
-        "baseline.cu",
-    ]
+def required_files(problem: Problem, impl_filenames: Sequence[str] = ()) -> List[str]:
+    """一道题必须齐备的文件。
+
+    impl_filenames 由科目提供(template / reference / baseline 的文件名),
+    spec.py 自己不硬编码任何科目相关的名字。
+    """
+    return [problem.statement, "spec.yaml", *impl_filenames]
 
 
-def missing_files(problem: Problem) -> List[str]:
-    return [f for f in required_files(problem) if not (problem.root / f).is_file()]
+def missing_files(problem: Problem, impl_filenames: Sequence[str] = ()) -> List[str]:
+    return [f for f in required_files(problem, impl_filenames)
+            if not (problem.root / f).is_file()]

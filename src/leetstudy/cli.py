@@ -13,7 +13,7 @@ from typing import List, Optional
 import click
 from rich.console import Console
 
-from . import bank, report
+from . import bank, report, subjects
 from . import config as cfgmod
 from .judge import judge
 from .spec import SpecError
@@ -116,7 +116,7 @@ def start(ctx: click.Context, problem_id: str, force: bool) -> None:
         console.print(f"[yellow]{sol} 已存在,未覆盖。[/yellow]")
         console.print("[dim]要重新生成请加 --force(会丢失你的代码)[/dim]")
     else:
-        template = prob.root / "template.cu"
+        template = prob.root / subjects.template_filename(prob.subject)
         if not template.is_file():
             console.print(f"[red]题目缺少模板文件 {template}[/red]")
             sys.exit(1)
@@ -273,15 +273,18 @@ def clean(ctx: click.Context, yes: bool) -> None:
 
 @main.command()
 @click.argument("requirement", nargs=-1, required=True)
+@click.option("--subject", type=click.Choice(subjects.available()), default=subjects.DEFAULT_SUBJECT,
+              help="出哪个科目的题(默认 cuda)")
 @click.option("--repair-rounds", type=int, default=3,
               help="独立验证失败时,回喂给出题者修复的最大轮数")
 @click.option("--no-validate", is_flag=True, help="跳过独立验证(不建议)")
 @click.pass_context
-def new(ctx: click.Context, requirement: tuple, repair_rounds: int,
+def new(ctx: click.Context, requirement: tuple, subject: str, repair_rounds: int,
         no_validate: bool) -> None:
     """让本地 claude 自动出题 + 自验证 + 自动修复。
 
     例:leet new 创建两道关于共享内存 bank conflict 的题,难度递进
+        leet new --subject pytorch 出一道 LayerNorm 的题
 
     出题者会自己跑 `leet validate` 迭代;完成之后框架**再独立验证一遍**
     (不采信它的自我声明),不过关就把报告回喂给它修。
@@ -299,11 +302,12 @@ def new(ctx: click.Context, requirement: tuple, repair_rounds: int,
 
     before = {p.id for p in bank.discover(cfg.problems_dir)}
     prompt = prompts.build_author_prompt(
-        req, cfg.root, existing_ids=sorted(before) or None
+        req, cfg.root, subject=subject, existing_ids=sorted(before) or None
     )
 
     console.print()
-    console.print("[bold]出题中[/bold]  [dim]本地 claude 会写文件、编译、自验证,过程实时汇报[/dim]")
+    console.print(f"[bold]出题中[/bold]  [dim]科目 {subject};"
+                  f"本地 claude 会写文件、自验证,过程实时汇报[/dim]")
     console.print("[dim]" + "─" * 62 + "[/dim]")
     result = agent.run(cfg, prompt, on_event=lambda m: console.print(f"[dim]  {m}[/dim]"))
 
@@ -414,7 +418,8 @@ def review(ctx: click.Context, problem_id: str, no_sanitize: bool) -> None:
         statement=prob.statement_text(),
         solution_src=sol.read_text(encoding="utf-8"),
         spec_yaml=(prob.root / "spec.yaml").read_text(encoding="utf-8"),
-        baseline_src=(prob.root / "baseline.cu").read_text(encoding="utf-8"),
+        baseline_src=(prob.root / subjects.baseline_filename(prob.subject))
+            .read_text(encoding="utf-8"),
         verdict_summary=report.verdict_to_text(verdict, cfg),
     )
 

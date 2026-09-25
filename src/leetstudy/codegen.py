@@ -26,6 +26,10 @@ from pathlib import Path
 from typing import Dict, List
 
 from .spec import Buffer, Problem
+from .subjects.base import JSON_MARKER
+
+# 兼容旧引用:早期 JSON_MARKER 定义在本模块里
+__all__ = ["JSON_MARKER"]
 
 JSON_MARKER = "@@LEET_JSON@@"
 

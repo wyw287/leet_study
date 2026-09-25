@@ -247,9 +247,12 @@ class Config:
 
 
 def load_config(root: Optional[Path] = None) -> Config:
-    """加载配置:config.yaml < 环境变量 < 调用方覆盖。"""
-    # 一律转绝对路径 —— 编译器/子进程的 cwd 未必是当前目录
-    root = (root or find_root()).expanduser().resolve()
+    """加载配置:config.yaml < 环境变量 < 调用方覆盖。
+
+    root 可以是 Path 或字符串,内部统一转绝对路径 ——
+    编译器/子进程的工作目录未必是当前目录。
+    """
+    root = (Path(root).expanduser() if root else find_root()).resolve()
     cfg = Config(root=root)
 
     cfg_path = root / CONFIG_FILENAME
@@ -388,6 +391,32 @@ def doctor(cfg: Config) -> List[Check]:
             "claude CLI", False, f"未找到 {cfg.claude_bin!r}",
             "出题(leet new)与讲评(leet review)需要它;设置 LEETSTUDY_CLAUDE_BIN",
         ))
+
+    # PyTorch 科目依赖(纯 CUDA 题不需要)
+    try:
+        import importlib.util
+        spec_torch = importlib.util.find_spec("torch")
+        if spec_torch is None:
+            checks.append(Check(
+                "torch", False, "未安装",
+                "PyTorch 科目的题目需要它:pip install torch==2.4.1"
+                "(驱动 535 支持到 CUDA 12.2,只能装 cu121 及更早的构建)",
+            ))
+        else:
+            import torch as _torch
+            cuda_ok = _torch.cuda.is_available()
+            detail = f"{_torch.__version__}  CUDA {'可用' if cuda_ok else '不可用'}"
+            checks.append(Check(
+                "torch", cuda_ok, detail,
+                "" if cuda_ok else
+                "torch 装上了但用不了 CUDA —— 多半是 wheel 的 CUDA 版本高于驱动支持的上限",
+            ))
+    except Exception as exc:  # noqa: BLE001  doctor 不该因为任何意外而崩
+        checks.append(Check("torch", False, f"检查失败:{type(exc).__name__}: {exc}"))
+
+    # ninja:只在「PyTorch + 自定义 CUDA 算子」的题上才需要(load_inline 用它编译)
+    if shutil.which("ninja") or (cfg_root_bin := (cfg.root / ".venv" / "bin" / "ninja")).is_file():
+        checks.append(Check("ninja", True, "可用(自定义 CUDA 算子题需要)"))
 
     # venv:确认没有误用他人的 anaconda
     import sys

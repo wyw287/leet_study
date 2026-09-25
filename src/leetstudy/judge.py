@@ -16,11 +16,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import diagnostics
+from . import diagnostics, subjects
 from .config import Config
 from .spec import Case, Problem
 from .subjects.base import BuildResult, CaseResult, SanitizeResult
-from .subjects.cuda import CudaSubject
 
 WARNING_GUARD_HITS = "guard_hits"
 
@@ -120,28 +119,29 @@ def judge(
     verbose: bool = False,
 ) -> Verdict:
     t0 = time.time()
-    subject = CudaSubject(cfg)
+    subject = subjects.get(problem.subject, cfg)
     build_root = cfg.build_dir_for(problem.id)
     verdict = Verdict(problem=problem, solution_src=Path(solution_src))
     verdict.hints = diagnostics.source_hints(
         Path(solution_src).read_text(encoding="utf-8")
-        if Path(solution_src).is_file() else ""
+        if Path(solution_src).is_file() else "",
+        subject=problem.subject,
     )
 
-    # ---- 1. 编译用户解 ----
-    build = subject.compile_variant(problem, Path(solution_src), build_root, "user")
+    # ---- 1. 准备用户解(编译 / 语法预检)----
+    build = subject.prepare_variant(problem, Path(solution_src), build_root, "user")
     verdict.build = build
     if not build.ok:
-        verdict.fatal = "编译失败"
+        verdict.fatal = "准备失败" if subject.name != "cuda" else "编译失败"
         verdict.hints = diagnostics.describe_build_failure(
             problem, build, Path(solution_src)
         ) + verdict.hints
         verdict.seconds = time.time() - t0
         return verdict
 
-    # ---- 2. 编译基线(失败不致命:只是没有加速比可算) ----
-    verdict.baseline_build = subject.compile_variant(
-        problem, problem.root / "baseline.cu", build_root, "baseline"
+    # ---- 2. 准备基线(失败不致命:只是没有加速比可算)----
+    verdict.baseline_build = subject.prepare_variant(
+        problem, problem.root / subject.baseline_filename, build_root, "baseline"
     )
 
     # ---- 3. 逐用例:正确性 + 稳定性 ----
@@ -158,11 +158,11 @@ def judge(
 
     reps = max(1, problem.verify.repeat)
     for case in selected:
-        result = subject.run_case(build.exe, case.name, perf=problem.perf.enabled)
+        result = subject.run_case(build.artifact, case.name, perf=problem.perf.enabled)
         ok_count = 1 if result.ok else 0
         # 再跑几遍确认稳定 —— 抓竞态 / 未初始化内存这类「有时对有时错」的问题
         for _ in range(reps - 1):
-            again = subject.run_case(build.exe, case.name, perf=False)
+            again = subject.run_case(build.artifact, case.name, perf=False)
             if again.ok:
                 ok_count += 1
 
@@ -172,9 +172,9 @@ def judge(
         )
         # 只在用例跑对时才测基线:正确性没过的话,性能数字没有意义,
         # 而基线计时(50 次 + 每次清 L2)不便宜,不该白花。
-        if result.ok and verdict.baseline_build.ok and verdict.baseline_build.exe:
+        if result.ok and verdict.baseline_build.ok and verdict.baseline_build.artifact:
             cv.baseline = subject.run_case(
-                verdict.baseline_build.exe, case.name, perf=problem.perf.enabled
+                verdict.baseline_build.artifact, case.name, perf=problem.perf.enabled
             )
         verdict.cases.append(cv)
 
@@ -188,15 +188,17 @@ def judge(
     )
 
     # ---- 5. 消毒检查 ----
-    if do_sanitize:
+    if do_sanitize and subject.supports_sanitize:
         smallest = problem.smallest_case.name
         if problem.sanitize.memcheck:
-            verdict.checks.append(subject.sanitize(build.exe, smallest, "memcheck"))
+            verdict.checks.append(
+                subject.sanitize(build.artifact, smallest, "memcheck")
+            )
         # racecheck 极慢:只在显式要求、或看到竞态特征(重复结果不一致)时跑
         want_race = force_racecheck or bool(verdict.unstable_cases)
         if want_race and problem.sanitize.racecheck_case:
             verdict.checks.append(
-                subject.sanitize(build.exe, problem.sanitize.racecheck_case, "racecheck")
+                subject.sanitize(build.artifact, problem.sanitize.racecheck_case, "racecheck")
             )
 
     # ---- 6. 诊断 ----

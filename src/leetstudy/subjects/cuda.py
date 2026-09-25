@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .. import codegen
-from ..config import Config, pick_gpu
+from ..config import Config
 from ..spec import Problem
-from .base import BuildResult, CaseResult, SanitizeResult
+from .base import Artifact, BuildResult, CaseResult, SanitizeResult, Subject
 
 # -O3:性能题必须开优化,否则测的是未优化代码
 # -lineinfo:让 compute-sanitizer / cuda-gdb 能报出行号(不影响优化)
@@ -21,32 +21,99 @@ _NVCC_FLAGS = ("-O3", "-lineinfo", "-std=c++17")
 _MEMCHECK_SUMMARY = re.compile(r"ERROR SUMMARY:\s*(\d+)\s+error", re.I)
 _RACECHECK_SUMMARY = re.compile(r"RACECHECK SUMMARY:\s*(\d+)\s+hazard", re.I)
 
+# 劣化解:必须每一个都被判失败,否则说明题目的测试太弱。
+# 它们都是**从 spec 泛化生成**的 —— 只需要知道有哪些 out 缓冲,与具体算法无关,
+# 所以对任何题目都适用,不需要手写特例。
+_MUTANT_DOC = {
+    "noop": "空实现(什么都不做)—— 必须被抓到,否则漏写输出也能过",
+    "zeros": "把输出全填 0 —— 若这也能过,说明期望值恰好是 0,测试退化",
+    "ones": "把输出全填 1 —— 若这也能过,说明期望值是常数,测试退化",
+    "first_only": "只写每块输出的第 0 个元素 —— 若这也能过,说明只检查了首元素",
+}
 
-class CudaSubject:
+
+def render_mutant(problem: Problem, kind: str) -> str:
+    """按 spec 泛化生成一份必然错误的 CUDA 实现(只需定义 launcher)。"""
+    lines: List[str] = [
+        "// 自动生成的劣化解 —— 用于区分度检查,不该出现在题目目录里。\n",
+        f"// 类型:{kind} —— {_MUTANT_DOC[kind]}\n",
+        '#include "ctx.h"\n\n',
+    ]
+
+    if kind == "noop":
+        lines.append(
+            f"void {problem.launcher}(LaunchCtx& ctx) {{\n"
+            "    (void)ctx;   // 什么都不做\n"
+            "}\n"
+        )
+        return "".join(lines)
+
+    fill_ops: List[str] = []
+    for b in problem.outputs:
+        ct = b.ctype
+        kname = f"leet_mut_fill_{b.name}"
+        lines.append(
+            f"__global__ void {kname}({ct}* buf, long long n, {ct} v) {{\n"
+            f"    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+            f"    long long stride = (long long)gridDim.x * blockDim.x;\n"
+            f"    for (; i < n; i += stride) buf[i] = v;\n"
+            f"}}\n\n"
+        )
+        count = f"leet_mut_n_{b.name}"
+        if kind == "first_only":
+            # 只写首元素:仍用同一个 kernel,但只覆盖 n=1
+            fill_ops.append(
+                f"    long long {count} = 1;   // 故意只覆盖首元素\n"
+                f"    {kname}<<<1, 1>>>(ctx.{b.name}, {count}, ({ct})1);\n"
+            )
+        else:
+            value = "0" if kind == "zeros" else "1"
+            fill_ops.append(
+                f"    long long {count} = {b.count_expr(prefix='ctx.')};\n"
+                f"    {kname}<<<((unsigned)(({count} + 255) / 256)), 256>>>"
+                f"(ctx.{b.name}, {count}, ({ct}){value});\n"
+            )
+
+    lines.append(f"void {problem.launcher}(LaunchCtx& ctx) {{\n")
+    lines.extend(fill_ops)
+    lines.append("}\n")
+    return "".join(lines)
+
+
+class CudaSubject(Subject):
     """Subject 协议的 CUDA 实现。"""
 
     name = "cuda"
+    template_filename = "template.cu"
+    reference_filename = "reference.cpp"
+    baseline_filename = "baseline.cu"
+    solution_filename = "solution.cu"
+    supports_sanitize = True
+    required_entry_keys = ("kernel", "launcher")
+    mutant_docs = _MUTANT_DOC
+    build_label = "编译"
+    build_note = "nvcc -O3 -lineinfo"
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
     # ------------------------------------------------------------------ #
-    # 编译
+    # 准备(编译)
     # ------------------------------------------------------------------ #
 
-    def compile_variant(
+    def prepare_variant(
         self,
         problem: Problem,
         impl_src: Path,
-        build_root: Path,
+        out_dir: Path,
         label: str = "variant",
     ) -> BuildResult:
         """把一份实现编译成可执行文件。
 
-        build_root 是 build/<problem>/,每个变体在 build_root/<label>/ 下独立编译。
+        out_dir 是 build/<problem>/,每个变体在 out_dir/<label>/ 下独立编译。
         """
         # 全部转绝对路径:nvcc 的工作目录是 variant_dir,相对路径会解析错
-        build_root = Path(build_root).resolve()
+        build_root = Path(out_dir).resolve()
         impl_src = Path(impl_src).resolve()
 
         codegen.write_ctx_h(problem, build_root)
@@ -54,7 +121,7 @@ class CudaSubject:
         files = codegen.write_variant(problem, variant_dir, impl_src)
         exe = variant_dir / "harness"
 
-        reference = (problem.root / "reference.cpp").resolve()
+        reference = (problem.root / self.reference_filename).resolve()
         if not reference.is_file():
             return BuildResult(
                 ok=False,
@@ -95,9 +162,10 @@ class CudaSubject:
         except OSError as exc:
             return BuildResult(ok=False, cmd=cmd, stderr=f"编译失败:{exc}")
 
+        ok = proc.returncode == 0 and exe.is_file()
         return BuildResult(
-            ok=proc.returncode == 0 and exe.is_file(),
-            exe=exe if exe.is_file() else None,
+            ok=ok,
+            artifact=Artifact(kind="exe", path=exe) if ok else None,
             cmd=cmd,
             stdout=proc.stdout,
             stderr=proc.stderr,
@@ -110,12 +178,13 @@ class CudaSubject:
 
     def run_case(
         self,
-        exe: Path,
+        artifact: Artifact,
         case: str,
         perf: bool = False,
         timeout: Optional[int] = None,
         extra_args: Optional[List[str]] = None,
     ) -> CaseResult:
+        exe = artifact.path
         cmd = [str(exe), case] + (["--perf"] if perf else []) + list(extra_args or [])
         env = self.cfg.env_for_gpu(None)
         t0 = time.time()
@@ -157,7 +226,7 @@ class CudaSubject:
 
     def sanitize(
         self,
-        exe: Path,
+        artifact: Artifact,
         case: str,
         tool: str,
         timeout: Optional[int] = None,
@@ -171,7 +240,8 @@ class CudaSubject:
                 skip_reason=f"未找到 {self.cfg.sanitizer},跳过检查",
             )
 
-        cmd = [san, "--tool", tool, "--error-exitcode", "1", str(exe), case]
+        cmd = [san, "--tool", tool, "--error-exitcode", "1",
+               str(artifact.path), case]
         env = self.cfg.env_for_gpu(None)
         t0 = time.time()
         try:
@@ -182,7 +252,7 @@ class CudaSubject:
                 text=True,
                 timeout=timeout or self.cfg.sanitizer_timeout,
                 env=env,
-                cwd=str(exe.parent),
+                cwd=str(artifact.path.parent),
             )
         except subprocess.TimeoutExpired:
             return SanitizeResult(
@@ -208,14 +278,11 @@ class CudaSubject:
         )
 
     # ------------------------------------------------------------------ #
-    # 脚手架
+    # 劣化解
     # ------------------------------------------------------------------ #
 
-    def scaffold(self, problem: Problem) -> str:
-        template = problem.root / "template.cu"
-        if template.is_file():
-            return template.read_text(encoding="utf-8")
-        return f"// 题目 {problem.id} 缺少 template.cu\n"
+    def mutants(self, problem: Problem) -> Dict[str, str]:
+        return {kind: render_mutant(problem, kind) for kind in _MUTANT_DOC}
 
 
 # --------------------------------------------------------------------------- #

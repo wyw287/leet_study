@@ -143,17 +143,70 @@ leet new "出两道关于 bank conflict 的题,难度递进"
 出题者的工具权限走白名单(`Read/Write/Edit/Glob/Grep` + `leet`/`nvcc`/
 `compute-sanitizer` 三个命令),不使用 `--dangerously-skip-permissions`。
 
+## 科目:同一套框架,多种语言
+
+一道题属于哪个科目由 `spec.yaml` 的 `subject` 字段决定(默认 `cuda`)。科目决定
+**谁来准备代码、怎么运行、怎么检查**:
+
+| 科目 | 你写什么 | 准备阶段 | 内存检查 | 题号前缀 |
+|---|---|---|---|---|
+| `cuda` | `.cu` 里的 kernel + 启动配置 | nvcc 编译 | memcheck / racecheck | `01-` |
+| `pytorch` | `.py` 里的 `forward(ctx)` | 语法预检(无需编译) | 可选(仅自定义算子题需要) | `py01-` |
+
+**用户接口各科目不同,但判题数据格式完全一致** —— 报告层与诊断层不区分科目。
+
+### PyTorch 科目
+
+```yaml
+subject: pytorch
+entry:
+  function: forward            # 用户要实现的函数名
+```
+
+`forward(ctx)` 的两种输出写法都支持:
+
+```python
+def forward(ctx):
+    return torch.softmax(ctx.x.t(), dim=1).t()      # 惯用写法,推荐
+    # 或者:
+    ctx.out.copy_(...)                               # 预分配缓冲,但多一次全量拷贝
+```
+
+为什么两种都留:`ctx.out` 是框架预分配的、带**哨兵区**的缓冲,能拿到
+「往前/往后越界了多少个元素」这种精度的诊断 —— 这对**自定义 CUDA 算子题**很有用。
+但它会比 `return` 多一次全量访存,在访存瓶颈题上足以让正确解法拿不到应有评级
+(py01 实测:3.30x → 1.87x)。所以让题目作者和解答者自己选。
+
+判题用的是 **CPU 上的纯 torch 参考解**(与 CUDA 侧同理:oracle 不能在 GPU 上
+自己引入竞态/越界),计时用 `torch.cuda.Event`,每次迭代前同样清 L2。
+
+### 加一个新科目
+
+实现 `subjects/base.py` 里的 `Subject` 基类,在 `subjects/__init__.py` 的
+`_REGISTRY` 里登记即可。需要提供:
+
+- `prepare_variant(problem, impl_src, out_dir, label) -> BuildResult(artifact=…)`
+- `run_case(artifact, case, perf, …) -> CaseResult`(输出的 JSON 结构要和 CUDA 侧一致)
+- 可选:`mutants()`(劣化解生成)、`sanitize()`、文件名、`build_label`
+
+`Artifact` 是不透明句柄 —— CUDA 下是编译出的可执行文件,PyTorch 下就是 `.py` 源码
+本身。Triton 只需复用 PyTorch 科目的 runner(Triton 的 JIT 对框架透明)。
+
 ## 目录结构
 
 ```
 problems/<id>/
-  spec.yaml       机器可读定义:接口契约、用例、容差、评分门槛
+  spec.yaml       机器可读定义:科目、接口契约、用例、容差、评分门槛
   problem.md      中文题面:讲解 + 提示 + 陷阱 + 思考题
-  template.cu     给学习者的骨架(故意不完整 —— 必须无法通过测试)
-  reference.cpp   CPU 参考解(oracle)
-  baseline.cu     朴素 CUDA 实现(加速比的分母)
+  template.cu     ┐
+  reference.cpp   ├ CUDA 科目的四个文件(由 spec.subject 决定实际用哪套)
+  baseline.cu     │
+  ────────────────┘
+  template.py     ┐
+  reference.py    ├ PyTorch 科目的三个文件
+  baseline.py     ┘
 solutions/<id>/
-  solution.cu     你的解答
+  solution.cu     你的解答(扩展名随科目)
 build/            编译产物(可 leet clean 清掉)
 ```
 
@@ -204,19 +257,24 @@ build/            编译产物(可 leet clean 清掉)
 
 按题目难度递进刷即可。规划中的完整路径(对应 PMPP 教材 / UIUC ECE408 的经典顺序):
 
-| # | 题目 | 考点 | 难度 |
-|---|---|---|---|
-| 01 | 向量加法 | 线程索引、边界、coalescing | 1 |
-| 02 | SAXPY | 标量参数、内存带宽 | 1 |
-| 03 | 矩阵转置 | 二维索引、共享内存分块、bank conflict | 2 |
-| 04 | 归约求和 | 树形归约、同步与竞态、warp shuffle | 3 |
-| 05 | 二维卷积 | halo 边界、共享内存分块 | 3 |
-| 06 | 矩阵乘(分块) | shared memory tiling、算术强度 | 3 |
-| 07 | 直方图 | 原子操作、私有化 | 3 |
-| 08 | 前缀和 | Kogge-Stone / Brent-Kung、double buffering | 4 |
-| 09 | Softmax | 数值稳定、块内归约、融合 | 3 |
-| 10 | LayerNorm | 两遍 vs Welford、算子融合 | 4 |
-| 11 | 寄存器分块矩阵乘 | register blocking、float4 向量化 | 5 |
-| 12 | Flash Attention | online softmax、tiling 融合 | 5 |
+| # | 题目 | 科目 | 考点 | 难度 |
+|---|---|---|---|---|
+| 01 | 向量加法 | cuda | 线程索引、边界、coalescing | 1 |
+| 02 | SAXPY | cuda | 标量参数、内存带宽 | 1 |
+| 03 | 矩阵转置 | cuda | 二维索引、共享内存分块、bank conflict | 2 |
+| 04 | 归约求和 | cuda | 树形归约、同步与竞态、warp shuffle | 3 |
+| 05 | 二维卷积 | cuda | halo 边界、共享内存分块、寄存器分块 | 3 |
+| py01 | 列方向 Softmax | pytorch | 归约维的访存方向、布局敏感性 | 2 |
+| 06 | 矩阵乘(分块) | cuda | shared memory tiling、算术强度 | 3 |
+| 07 | 直方图 | cuda | 原子操作、私有化 | 3 |
+| 08 | 前缀和 | cuda | Kogge-Stone / Brent-Kung、double buffering | 4 |
+| 09 | Softmax(手写 kernel) | cuda | 数值稳定、块内归约、融合 | 3 |
+| 10 | LayerNorm | cuda | 两遍 vs Welford、算子融合 | 4 |
+| 11 | 寄存器分块矩阵乘 | cuda | register blocking、float4 向量化 | 5 |
+| 12 | Flash Attention | cuda | online softmax、tiling 融合 | 5 |
 
 未完成的题目可以用 `leet new` 生成,再人工过一遍。
+
+两条轨道的配合也值得注意:`py01` 让你先摸到"归约维放错地方"的代价(纯 PyTorch
+就能修),而 `09` 要你亲手写 kernel 把同一件事做到 2 遍访存的下限 —— 先看到差距,
+再去填平它。

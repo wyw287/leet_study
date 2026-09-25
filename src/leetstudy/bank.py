@@ -169,14 +169,21 @@ class Progress:
 
 
 def solution_path(solutions_dir: Path, problem: Problem) -> Path:
-    return solutions_dir / problem.id / "solution.cu"
+    """解答文件路径。扩展名由题目所属科目决定(solution.cu / solution.py)。"""
+    from . import subjects
+    return solutions_dir / problem.id / subjects.solution_filename(problem.subject)
 
 
 def all_missing_files(problems: List[Problem]) -> List[Tuple[str, List[str]]]:
     """返回文件不齐的题目,供 `leet validate` 使用。"""
+    from . import subjects
     out = []
     for p in problems:
-        missing = missing_files(p)
+        try:
+            names = subjects.impl_filenames(p.subject)
+        except KeyError:
+            names = []
+        missing = missing_files(p, names)
         if missing:
             out.append((p.id, missing))
     return out

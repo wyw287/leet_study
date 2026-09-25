@@ -9,6 +9,170 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List
 
+SPEC_SCHEMA_PYTORCH = r"""
+## spec.yaml 完整字段说明(PyTorch 科目)
+
+```yaml
+id: <目录名,必须与目录名完全一致,建议 py 前缀,如 py02-layernorm>
+title: <中文标题>
+subject: pytorch                # 必须写,否则会被当成 cuda 科目
+difficulty: 1..5
+tags: [<英文标签>]
+concepts: [<中文考点,写给学习者看>]
+statement: problem.md
+
+# ---- 接口契约:决定 forward(ctx) 里 ctx 有哪些字段 ----
+buffers:
+  - name: <Python 标识符>
+    dtype: f32 | f64 | i32 | i64 | u32 | u8      # 直接映射到 torch dtype
+    shape: [<参数名或整数字面量>]                 # 空列表 [] 表示标量
+    role: in | out | scratch
+    fill: uniform | positive | randint | zero    # 仅 role=in 有效
+    #   uniform  → [-1, 1)
+    #   positive → (0, 1]   给 log / 开方 / 除法等定义域为正的题用
+    #   randint  → 0..99 的整数
+    #   zero     → 全 0
+params:
+  - {name: <标识符>, dtype: i32 | f32 | ...}
+    # 标量参数,会作为字段出现在 ctx 上。形状表达式里可以引用它们。
+    # 浮点类型的参数可以给小数取值(如 alpha: 0.5、eps: 1e-5)。
+
+entry:
+  function: forward
+    # 学习者要实现的函数名。注意:参考解用的名字是**固定的** reference(ctx),
+    # 与 entry.function 无关 —— 它是 oracle,不是学习者的接口。
+
+cases:
+  - {name: <用例名>, params: {<每个参数都给一个取值>}}
+    # 取值必须是正数;整数类型的参数必须是整数(会被用来算张量形状)
+
+verify:
+  atol: 1e-5      # 过宽的容差会让错误实现轻松通过,框架会拒绝 atol>1.0 / rtol>0.1
+  rtol: 1e-4
+  repeat: 3       # 每个用例重复跑几次。>1 用于捕捉不确定性
+
+perf:
+  enabled: true
+  bound: memory | compute
+  metric: bandwidth | speedup
+    #   bandwidth —— 按「有效带宽占峰值百分比」评级。**访存瓶颈题的基线往往
+    #                已经是"用对了 API 但撞上坏布局",用加速比没有区分度。**
+    #   speedup   —— 按「相对基线的加速比」评级。纯 PyTorch 题大多用这个:
+    #                基线是一段自然的、但慢的写法,优化空间来自布局/融合。
+    #   metric 不写时按 bound 推断:memory→bandwidth。
+  repeat: 30
+  warmup: 5
+  grades: {...}   # 含义随 metric 变:
+                  #   bandwidth → 占峰值百分比,如 {B: 50, A: 70, S: 85}
+                  #   speedup   → 倍数,如 {B: 1.5, A: 2.2, S: 3.0}
+  flush_l2: true  # 默认开启,不要关。4090 有 72MB L2,不清缓存测的是缓存带宽。
+
+sanitize:
+  memcheck: false
+    # 纯 PyTorch 题(只用 torch 算子)**必须设 false** —— 没有自定义 kernel,
+    # compute-sanitizer 只会把整个 torch 库拖慢几十倍而毫无所得。
+    # 只有当题目要求学习者写**自定义 CUDA 算子**(如 load_inline)时才设 true。
+```
+
+## 运行环境(必须按这个来设计,否则题目会不可用)
+
+- GPU: NVIDIA RTX 4090 ×5,**理论峰值带宽 1008 GB/s**;torch 2.4.1+cu121
+- 框架自动在每次计时迭代前**清空 L2**(读一个 256MB 的缓冲),所以测到的是真实显存带宽
+- 计时用 `torch.cuda.Event`,分辨率约 0.5µs。因此:
+  - **总耗时不到 20µs 的用例会被自动跳过评级**。注意纯 PyTorch 题的算子很容易
+    跑得很快 —— 用例规模要给足。经验值:访存型题目数据量要 ≥ 100MB
+    (如 32M 个 f32 = 128MB,约 130µs)。
+  - 但也不能太大:基线耗时超过 5 秒会让做题体验崩坏。
+- 参考解在 **CPU** 上用 torch 跑(与 CUDA 侧同理:oracle 必须自身不可能有 GPU
+  侧的错误)。用 float64 计算以保证接近真值。
+- 学习者的 `forward(ctx)` 可以 `return` 张量,也可以写进 `ctx.<out>` 再 return None。
+  两种都支持。注意:`ctx.out` 是预分配缓冲,写它要多一次全量拷贝 —— 对访存瓶颈题
+  这个代价很显著,出题时要把这件事讲清楚。
+- 框架在 `out` / `scratch` 缓冲前后各留 4096 个元素的**哨兵区**填特殊值;但只要学习者
+  选择 `return` 张量,哨兵区就用不上了(PyTorch 自己分配)。纯 PyTorch 算子也不可能
+  越界写用户张量,所以这个损失可接受 —— **但题面里不要承诺"越界会被抓到"**。
+"""
+
+REQUIREMENTS_PYTORCH = r"""
+## 硬性要求
+
+### reference.py —— 标准答案(oracle)
+- 只定义 `def reference(ctx):`,用 `ctx.` 访问所有张量
+- **必须完全正确**。它是判分的基准,写错了整道题就废了
+- 在 **CPU** 上跑。浮点计算请先 `.to(torch.float64)`,最后再 `to(原 dtype)` 写回
+- 不要写 `forward` 这个名字 —— 那是学习者的接口
+
+### baseline.py —— 性能基线(加速比的分母)
+- 必须定义 `def forward(ctx):`(与 entry.function 同名)
+- **必须正确**(框架会检查:基线与参考解在**所有**用例上必须一致)
+- 要是**自然、直白**的写法 —— 它是学习者要超越的对象。
+  纯 PyTorch 题的基线通常是"用对了 API、但布局或写法不够好",
+  而不是"故意写烂"。这样学习者学到的是**真实的经验判断**,不是应付题目。
+- 基线必须真的**有优化空间**。定 grades 之前先实测一遍:
+  如果基线已经是理论最优(比如就是 `torch.softmax` 的正确用法),
+  那这道题不该出,或者要改成 `bandwidth` 指标并诚实说明"没有优化空间"。
+- **不要**用 `ctx.out.copy_(...)` 写基线 —— 那次拷贝是额外开销,
+  会让基线显得比实际更慢。直接 `return` 张量。
+
+### template.py —— 给学习者的骨架
+- 只写 `import torch` + `def forward(ctx):` 的**空壳**,里面是 TODO 注释
+- **必须不完整到无法通过测试** —— 框架会检查「空模板必须被判失败」
+- 注释要有教学价值:讲清这道题的思路、常见陷阱、以及为什么
+
+### problem.md —— 题面
+- **中文**,面向会写 PyTorch 但没做过性能优化的人
+- 结构:题目描述 → 为什么这道题重要 → 慢在哪(要有**实测数字**)→ 解法思路 →
+  陷阱 → 评分说明 → 3~4 个思考题
+- 解释要落到**物理原因**上(访存模式、算子融合、中间张量物化、同步点),
+  不要只说「建议这样写」
+- **诚实**:如果某个"优化"实测下来没有用甚至更慢,就直说 —— 那往往是最有价值的
+  一段内容。不要写你没验证过的断言。
+
+### cases
+- 至少一个用例大到可评级(见上文 20µs 规则,纯 PyTorch 题尤其要注意)
+- **必须包含边界用例**:非 2 的幂、质数规模、或者会让某一维退化的形状
+- 形状的选择本身要能说明问题(比如"瘦高" vs "方阵"会得出不同结论 —— 那就都放上)
+"""
+
+WORKFLOW_PYTORCH = r"""
+## 你该怎么做
+
+**按这个顺序做,不要跳步。** 写文件很快,而测量与迭代很慢 —— 先把该写的写完。
+
+> **不要通读框架源码**(`src/leetstudy/` 下的文件)。出题需要的信息都在上面。
+
+### 第一步:想清楚(不要动笔)
+这道题的**性能瓶颈**是什么?纯 PyTorch 题的优化空间通常来自这几处:
+   - 归约发生在访存不连续的维度上
+   - 中间结果被反复物化(该融合的没融合)
+   - 多余的全量拷贝(布局转换、dtype 转换、`.contiguous()` 用错地方)
+   - 同步点(`.item()` / `.cpu()` / `.numpy()`)打断了 GPU 流水
+   - 算子本身是多个小内核,而可以合并成一次
+
+先想清楚是哪一类,再决定基线怎么写、指标怎么选。
+
+### 第二步:一口气写完 4 个文件
+1. `spec.yaml`
+2. `reference.py`(CPU 参考解,float64)
+3. `baseline.py`(自然但慢的写法)
+4. `template.py`(空壳)
+5. **`problem.md`(题面)** —— 一定要在这一步写完,不要留占位符。
+   `leet validate` 会检查题面至少有 600 字符、有章节结构、含「思考题」。
+
+### 第三步:测量与调参(这一步最容易做错)
+6. **先实测,再定 gates**。PyTorch 科目不需要编译,所以 `leet validate` 只要几秒,
+   可以放心多跑几次。但 `leet validate` 只会告诉你**基线**的耗时 ——
+   想知道优化解能拿多少分,你要自己写一份正解放进 `solutions/<id>/solution.py`,
+   跑 `leet test <id>` 看实际加速比。
+   **门槛必须物理可达**:先量出正解的加速比上限,再把 S 设在它的 ~90%,
+   A/B 依次下移。设一个永远拿不到的门槛等于没有评级。
+7. 迭代到 `leet validate <id>` 全部通过(尤其是「模板必须失败」和四个劣化解)。
+8. **定稿后把 `solutions/<id>/` 整个删掉**,不要留答案在学习者的工作区里。
+
+### 最后
+用一句话汇报:题目 id、考点、指标与门槛、**实测数字**(基线耗时、正解耗时、加速比)。
+"""
+
 SPEC_SCHEMA = r"""
 ## spec.yaml 完整字段说明
 
@@ -182,16 +346,37 @@ REVIEW_PROMPT = r"""你是一位 CUDA 教学助手。下面是一个学习者对
 """
 
 
-def build_author_prompt(requirement: str, root: Path, example_id: str = "01-vector-add",
-                        existing_ids: List[str] = None) -> str:
+#: 各科目的默认范例题目(提示词里会把它整份读进来当 few-shot)
+DEFAULT_EXAMPLE = {
+    "cuda": "01-vector-add",
+    "pytorch": "py01-softmax-dim0",
+}
+
+
+def _blocks(subject: str):
+    """按科目选对应的三块提示词。"""
+    if subject == "pytorch":
+        return SPEC_SCHEMA_PYTORCH, REQUIREMENTS_PYTORCH, WORKFLOW_PYTORCH
+    return SPEC_SCHEMA, REQUIREMENTS, WORKFLOW
+
+
+def build_author_prompt(requirement: str, root: Path, subject: str = "cuda",
+                        example_id: str = "", existing_ids: List[str] = None) -> str:
     """组装出题用的完整提示词。
 
     直接把题库里一道已通过验证的题完整读进来当范例 —— 这样提示词与真实的
     spec 格式永远同步,不会因为文档漂移而生成出格式过时的题目。
+
+    范例文件按科目取:PyTorch 题没有 template.cu 之类。
     """
+    schema, requirements, workflow = _blocks(subject)
+    example_id = example_id or DEFAULT_EXAMPLE.get(subject, "01-vector-add")
     example_dir = root / "problems" / example_id
+    example_files = ("spec.yaml", "reference.py", "baseline.py", "template.py") \
+        if subject == "pytorch" else \
+        ("spec.yaml", "reference.cpp", "baseline.cu", "template.cu")
     example_text = ""
-    for fname in ("spec.yaml", "reference.cpp", "baseline.cu", "template.cu"):
+    for fname in example_files:
         f = example_dir / fname
         if f.is_file():
             example_text += f"\n### {fname}\n```\n{f.read_text(encoding='utf-8')}\n```\n"
@@ -204,7 +389,14 @@ def build_author_prompt(requirement: str, root: Path, example_id: str = "01-vect
             + "\n"
         )
 
-    return f"""你是一位 CUDA 教学专家,正在为一个「LeetCode 式的 CUDA 刷题框架」出题。
+    subject_line = (
+        "**本批题目属于 `pytorch` 科目** —— 学习者用 Python 写 `forward(ctx)`,"
+        "不需要写 CUDA。"
+        if subject == "pytorch" else
+        "**本批题目属于 `cuda` 科目** —— 学习者写 kernel 与启动配置。"
+    )
+
+    return f"""你是一位 CUDA / PyTorch 教学专家,正在为一个「LeetCode 式的刷题框架」出题。
 
 # 学习者的需求
 
@@ -212,12 +404,15 @@ def build_author_prompt(requirement: str, root: Path, example_id: str = "01-vect
 {existing}
 # 你要产出什么
 
-在 `problems/<新题id>/` 目录下产出 5 个文件:spec.yaml / problem.md / template.cu /
-reference.cpp / baseline.cu。id 用小写短横线风格并带序号前缀,如 `05-conv2d`。
+{subject_line}
 
-{SPEC_SCHEMA}
-{REQUIREMENTS}
-{WORKFLOW}
+在 `problems/<新题id>/` 目录下产出 5 个文件:spec.yaml / problem.md / template /
+reference / baseline(扩展名随科目:PyTorch 是 `.py`,CUDA 是 `.cu` / `.cpp`)。
+id 用小写短横线风格并带序号前缀。
+
+{schema}
+{requirements}
+{workflow}
 
 # 完整范例(已通过全部校验,请严格对照它的格式与注释风格)
 

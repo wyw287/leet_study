@@ -102,12 +102,22 @@ def render_verdict(
 def _render_build(console: Console, verdict: Verdict) -> None:
     build = verdict.build
     if build is None:
-        console.print("编译    [dim]未执行[/dim]")
+        console.print("准备    [dim]未执行[/dim]")
         return
+    # 措辞按科目走:CUDA 是「编译」,解释型语言是「准备」
+    from . import subjects as _subjects
+    label = "准备"
+    note = ""
+    try:
+        label = _subjects.build_label(verdict.problem.subject)
+        note = _subjects.build_note(verdict.problem.subject)
+    except KeyError:
+        pass
+    pad = " " * max(0, 8 - len(label))
     if build.ok:
-        console.print(f"编译    {OK}  nvcc -O3 -lineinfo  [dim]{build.seconds:.1f}s[/dim]")
+        console.print(f"{label}{pad}{OK}  [dim]{note}  {build.seconds:.1f}s[/dim]")
     else:
-        console.print(f"编译    {BAD}  [red]失败[/red] [dim]{build.seconds:.1f}s[/dim]")
+        console.print(f"{label}{pad}{BAD}  [red]失败[/red] [dim]{build.seconds:.1f}s[/dim]")
 
 
 def _render_correctness(console: Console, verdict: Verdict) -> None:
@@ -300,6 +310,10 @@ def render_problem_list(
     table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1),
                   expand=False)
     table.add_column("题号", no_wrap=True)
+    # 题库里有多个科目时才显示这一列 —— 只有一个科目时它是纯噪音
+    multi_subject = len({p.subject for p in problems}) > 1
+    if multi_subject:
+        table.add_column("科目", no_wrap=True, style="dim")
     table.add_column("题目", no_wrap=True, max_width=20, overflow="ellipsis")
     table.add_column("难度", no_wrap=True)
     table.add_column("状态", no_wrap=True)
@@ -330,8 +344,12 @@ def render_problem_list(
         if len(p.tags) > 2:
             tags += f" +{len(p.tags) - 2}"
 
-        table.add_row(p.id, p.title, f"[dim]{difficulty_bar(p.difficulty)}[/dim]",
-                      state, best, tags)
+        cells = [p.id]
+        if multi_subject:
+            cells.append(p.subject)
+        cells += [p.title, f"[dim]{difficulty_bar(p.difficulty)}[/dim]",
+                  state, best, tags]
+        table.add_row(*cells)
     console.print()
     console.print(table)
     solved = sum(1 for p, e in rows if e.solved)

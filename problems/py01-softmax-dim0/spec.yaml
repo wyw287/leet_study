@@ -1,0 +1,56 @@
+id: py01-softmax-dim0
+title: 列方向 Softmax
+subject: pytorch
+difficulty: 2
+tags: [softmax, memory-layout, pytorch, reduction]
+concepts:
+  - 归约维是否访存连续,决定 PyTorch 内核的快慢
+  - 非连续张量(视图)与 .contiguous() 的真实代价
+  - 「先付一次拷贝换后续高效」的取舍
+statement: problem.md
+
+# x 与 out 都是 rows×cols、按行连续(row-major)的 f32 张量
+buffers:
+  - {name: x,   dtype: f32, shape: [rows, cols], role: in}
+  - {name: out, dtype: f32, shape: [rows, cols], role: out}
+params:
+  - {name: rows, dtype: i32}
+  - {name: cols, dtype: i32}
+
+entry:
+  function: forward
+
+cases:
+  # 8192² × 4B = 256MB 读写 ≈ 512MB 访存,4090 上 DRAM 下限约 510µs
+  - {name: square, params: {rows: 8192,  cols: 8192}}
+  # 更瘦高的形状:归约维(rows)很长,跨步代价更明显
+  - {name: tall,   params: {rows: 32768, cols: 2048}}
+  # 比一个 warp 还小:考边界,同时给 racecheck 类检查留个小用例
+  - {name: tiny,   params: {rows: 37,    cols: 53}}
+
+verify:
+  # 参考解在 CPU 上用 float64 计算,接近真值;f32 的 exp 与求和顺序差异
+  # 会带来 ~1e-7 量级的相对误差,这里留足余量
+  atol: 1e-5
+  rtol: 1e-4
+  repeat: 3
+
+perf:
+  bound: memory
+  metric: speedup
+  repeat: 30
+  warmup: 5
+  # 门槛由实测定(用框架自己跑出来的数字,与独立基准脚本一致):
+  #   square: 基线 6.845ms
+  #     正解 softmax(x.t(), dim=1).t()  → 2.076ms = 3.30x   ← 上限
+  #     写进 ctx.out                   → 3.667ms = 1.87x(多一次拷贝)
+  #     手写 max/exp/sum/div 展开       → 3.803ms = 1.80x(物化中间结果)
+  #   tall:   基线 26.305ms,正解 2.016ms = 13.05x
+  # 基线有效带宽只有 78 GB/s / 20 GB/s,而峰值是 1008 GB/s —— 全在访存模式上。
+  # S=3.0 要求达到正解的 ~91%,即真的把归约挪到了正确的维度上。
+  grades: {B: 1.5, A: 2.2, S: 3.0}
+
+sanitize:
+  # 纯 PyTorch 题:没有自定义 CUDA kernel,memcheck 只会拖慢而无所得。
+  # (如果这道题要求写自定义算子,就把它打开。)
+  memcheck: false
