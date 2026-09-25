@@ -19,3 +19,5 @@ __pycache__/
 
 # 题目缓存(参考输出等)
 problems/*/.cache/
+progress.json
+solutions/*
