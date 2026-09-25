@@ -21,3 +21,6 @@ __pycache__/
 problems/*/.cache/
 progress.json
 solutions/*
+
+# 其他
+CLAUDE.md
