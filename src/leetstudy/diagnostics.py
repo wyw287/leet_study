@@ -231,17 +231,15 @@ def source_hints(src: str, subject: str = "cuda") -> List[str]:
     PyTorch 关心有没有同步点、有没有把张量当 Python 对象逐个处理。
     这些都不影响判分,只作教学提醒。
     """
+    if subject == "pytorch":
+        return _pytorch_source_hints(src)
 
     def strip_comments(text: str) -> str:
         text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
         text = re.sub(r"//[^\n]*", "", text)
-        text = re.sub(r"#[^\n]*", "", text)
         return text
 
-    code = strip_comments(src)
-    if subject == "pytorch":
-        return _pytorch_source_hints(code)
-    return _cuda_source_hints(code)
+    return _cuda_source_hints(strip_comments(src))
 
 
 def _cuda_source_hints(code: str) -> List[str]:
@@ -275,12 +273,88 @@ def _cuda_source_hints(code: str) -> List[str]:
 
 # PyTorch 侧的高频性能陷阱:同步点、逐元素 Python 循环
 _RE_TORCH_SYNC = re.compile(r"torch\.cuda\.synchronize\s*\(|\.item\s*\(\s*\)|\.cpu\s*\(\s*\)|\.numpy\s*\(\s*\)")
-_RE_TORCH_LOOP = re.compile(r"for\s+\w+\s+in\s+range\s*\(\s*\w+\.(shape|size)")
-_RE_CTX_REBIND = re.compile(r"\bctx\s*\.\s*\w+\s*=")
+# 注意要允许链式属性:本题的张量挂在 ctx 上,真实写法是 ctx.x.shape[0]。
+# 早先只写了 \w+\.shape,结果恰好漏掉最该命中的那一种。
+_RE_TORCH_LOOP = re.compile(
+    r"for\s+\w+\s+in\s+range\s*\(\s*[\w.]+\.(?:shape|size)"
+)
 
 
-def _pytorch_source_hints(code: str) -> List[str]:
+def _python_code_only(src: str) -> str:
+    """把注释与字符串字面量(含 docstring)抹成等长的空白,只留可执行代码。
+
+    两个都必须做对:
+
+    * **为什么用 tokenize 而不是正则** —— 只有它能可靠区分「字符串里提到某写法」
+      和「真的写了那种写法」。这不是理论问题:模板的 docstring 里专门有句提醒
+      「不要写 `ctx.out = ...`」,正则会把**那句提示本身**当成违规代码,
+      于是每道 PyTorch 题一跑就报一次假警报。
+
+    * **为什么是「抹成等长空白」而不是「取出 token 再拼回去」** —— 后者会改变
+      相邻符号之间的距离,`.item()` 会变成 `. item ( )`,于是所有依赖相邻性的
+      正则(如 `.item\\s*\\(`)全部失效。原地打码则完整保留原有间距与换行。
+    """
+    import io
+    import tokenize
+
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return src                # 语法不完整时退回原文;编译阶段另有更准确的报错
+
+    # 行号/列号 → 绝对偏移
+    line_starts = []
+    offset = 0
+    for line in src.splitlines(keepends=True):
+        line_starts.append(offset)
+        offset += len(line)
+
+    def abs_pos(row: int, col: int) -> int:
+        if row - 1 >= len(line_starts):
+            return len(src)
+        return min(line_starts[row - 1] + col, len(src))
+
+    chars = list(src)
+    for tok in toks:
+        if tok.type not in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        for i in range(abs_pos(*tok.start), abs_pos(*tok.end)):
+            if chars[i] != "\n":       # 保留换行,行结构不乱
+                chars[i] = " "
+    return "".join(chars)
+
+
+def _ctx_rebindings(src: str) -> List[str]:
+    """用 AST 找出**真的**对 `ctx.<字段>` 的赋值,返回字段名。
+
+    比正则精确:它只看赋值语句的目标,不会被字符串或注释里的同名文本骗到。
+    而且能拿到具体字段名 —— 「你把 ctx.out 重新赋值了」比
+    「你对 ctx 的某个字段赋值了」有用得多。
+    """
+    import ast
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return []
+    names: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            if (isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "ctx"):
+                names.append(target.attr)
+    return names
+
+
+def _pytorch_source_hints(src: str) -> List[str]:
     hints: List[str] = []
+    code = _python_code_only(src)
 
     if _RE_TORCH_SYNC.search(code):
         hints.append(
@@ -294,11 +368,23 @@ def _pytorch_source_hints(code: str) -> List[str]:
             "都是一次独立的内核启动(几十微秒起),而一次算子调用只启动一个内核。"
             "尽量把操作表达成整张量的算子。"
         )
-    if _RE_CTX_REBIND.search(code):
-        hints.append(
-            "检测到 `ctx.<字段> = ` 形式的赋值。如果你把 ctx.out 指向了新张量,"
-            "框架就看不到你的结果了 —— 请写进 ctx.out 本身,或者直接 return 张量。"
-        )
+
+    rebound = list(dict.fromkeys(_ctx_rebindings(src)))
+    if rebound:
+        fields = "、".join(f"ctx.{n}" for n in rebound)
+        affected = [n for n in rebound if n in ("out",)]
+        if affected:
+            hints.append(
+                f"检测到对 {fields} 的赋值。你把它指向了新张量,"
+                f"框架就看不到你的结果了 —— 请写进 ctx.out 本身(用 .copy_),"
+                f"或者直接 return 张量。"
+            )
+        else:
+            hints.append(
+                f"检测到对 {fields} 的赋值。ctx 上的字段由框架准备好,"
+                f"重新赋值不会改变实际的数据;要写结果请写进 ctx.out,"
+                f"或者直接 return 张量。"
+            )
     return hints
 
 
