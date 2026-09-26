@@ -1,0 +1,59 @@
+id: cpp01-matmul-loop-order
+title: 矩阵乘:把内层循环换过来
+subject: cpp
+difficulty: 3
+tags: [cache, loop-order, memory-locality, optimization]
+concepts: [访存局部性, 循环次序变换, cache line, 为什么编译器不会自动帮你换]
+statement: problem.md
+
+# ---- 接口契约 ----
+buffers:
+  - {name: A, dtype: f32, shape: [n, n], role: in}
+  - {name: B, dtype: f32, shape: [n, n], role: in}
+  - {name: C, dtype: f32, shape: [n, n], role: out}
+params:
+  - {name: n, dtype: i32}
+
+entry:
+  function: matmul          # 你要改的就是这个函数
+
+cases:
+  # square 是评分用的规模;odd 考非 2 的幂;tiny 只用于快速的结构检查
+  - {name: square, params: {n: 384}}
+  - {name: odd,    params: {n: 257}}
+  - {name: tiny,   params: {n: 32}}
+
+verify:
+  # f32 累加 384 项,与 double 参考解之间本就有 ~1e-5 量级的差;
+  # 但也不能太松 —— 收紧了才能把「算错」和「算得不够快」分开
+  atol: 1e-3
+  rtol: 1e-4
+  repeat: 2
+
+perf:
+  enabled: true
+  bound: compute
+  metric: speedup
+  # 基线(n=384)实测约 80ms,所以 repeat 不能按默认的 50 ——
+  # 那会变成 60 次 × 80ms = 5 秒白等。15 次足够取中位数。
+  repeat: 15
+  warmup: 3
+  # 门槛由实测倒推(2026-09-26,本机 EPYC 7763;参考解见 optimal.cpp):
+  #   square(n=384)基线 78.4~79.1ms → 参考解 4.7~4.9ms
+  #   参考解评级共测 10 次:安静时 16.2~16.9x;**有并发负载时最低到 14.05x**
+  #   (那次是 `leet validate --all` 跑着的时候我又在编辑文件、跑别的命令)
+  #
+  # S 取 13.0 而不是"实测上限的 90%":上限 16.7 的 90% 是 15.0,但参考解自己
+  # 在负载下会掉到 14.05 —— 那样 S 就变成"你挑了个机器空闲的时候测",
+  # 而不是"你写出了好代码"。这跟本框架拒绝缓存基线耗时是同一条理由。
+  # 13.0 比观察到的最差一次还低 7.5%,安静时低于上限 22%。
+  grades: {B: 3.0, A: 9.0, S: 13.0}
+  # ★ 这是一道**优化题**:基线本身就是正确代码,所以只看正确性的话
+  #   把原代码原样交回来就算通过。设了 required_grade 之后,
+  #   「通过」= 正确性 + 评级达标。
+  required_grade: B
+  flush_l2: true
+
+sanitize:
+  # cpp 科目暂未接入 ASan/UBSan(见 subjects/cpp.py)
+  memcheck: false

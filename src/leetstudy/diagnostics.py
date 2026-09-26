@@ -228,11 +228,17 @@ def source_hints(src: str, subject: str = "cuda") -> List[str]:
     """对用户源码做轻量静态扫描,给出提示。
 
     提示是**科目相关**的:CUDA 关心有没有启动 kernel、有没有漏同步;
-    PyTorch 关心有没有同步点、有没有把张量当 Python 对象逐个处理。
-    这些都不影响判分,只作教学提醒。
+    PyTorch 关心有没有同步点、有没有把张量当 Python 对象逐个处理;
+    C++(优化题)关心有没有把外层框架的活重复做一遍。
+
+    ⚠️ 科目必须在这里分派干净。曾经 cpp 科目落进了 CUDA 分支,于是
+    `leet test cpp01` 对着一个纯 C++ 文件报「源码里没有找到 <<< >>> 启动语法」
+    —— 提示本身没错,但科目搞错了,读起来像框架坏了。
     """
     if subject == "pytorch":
         return _pytorch_source_hints(src)
+    if subject == "cpp":
+        return _cpp_source_hints(src)
 
     def strip_comments(text: str) -> str:
         text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
@@ -240,6 +246,32 @@ def source_hints(src: str, subject: str = "cuda") -> List[str]:
         return text
 
     return _cuda_source_hints(strip_comments(src))
+
+
+def _cpp_source_hints(src: str) -> List[str]:
+    """C++ 优化题的提示。
+
+    这里刻意**不给"你应该这样优化"的建议** —— 那等于把答案写在提示里。
+    只提醒三类「把框架已经做好的事又做了一遍」的情况,那些都是纯粹的浪费,
+    指出来不泄露思路。
+    """
+    hints: List[str] = []
+    code = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+    code = re.sub(r"//[^\n]*", "", code)
+
+    if re.search(r"\b(malloc|calloc|realloc|new\s+\w|std::vector\s*<)", code):
+        hints.append(
+            "检测到函数里自己分配了内存。框架已经把输入输出都准备好了;"
+            "如果每调用一次就分配一次,分配器本身的开销会算进性能里 —— "
+            "自带工作区的话,考虑放进 spec 声明的 scratch 缓冲,或只分配一次。"
+        )
+    if re.search(r"\b(printf|std::cout|fprintf|cerr)\b", code):
+        hints.append(
+            "检测到函数里有打印。I/O 极慢且会被计入耗时,调试完记得删掉。"
+        )
+    if re.search(r"\b(ifstream|ofstream|fopen|fwrite)\b", code):
+        hints.append("检测到文件读写,它会被计入耗时。")
+    return hints
 
 
 def _cuda_source_hints(code: str) -> List[str]:

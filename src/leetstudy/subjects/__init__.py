@@ -14,6 +14,7 @@ from .base import Artifact, BuildResult, CaseResult, JSON_MARKER, SanitizeResult
 _REGISTRY: Dict[str, Tuple[str, str]] = {
     "cuda": ("leetstudy.subjects.cuda", "CudaSubject"),
     "pytorch": ("leetstudy.subjects.pytorch", "PyTorchSubject"),
+    "cpp": ("leetstudy.subjects.cpp", "CppSubject"),
 }
 
 #: spec.yaml 未声明 subject 时用哪个(保持既有 CUDA 题目无需改动)

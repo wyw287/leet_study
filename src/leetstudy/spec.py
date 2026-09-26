@@ -160,6 +160,15 @@ class Perf:
     flush_l2: bool = True
     # 只影响报告措辞:memory = 访存瓶颈,compute = 计算瓶颈。
     bound: str = "memory"
+    # 「优化题」的通过门槛:设了它,这道题就要求**性能也达标才算过**。
+    #
+    # 只有一种题需要它:**基线本身就是正确代码**,题目问的是「把它改快」。
+    # 这类题的模板就是那段正确但慢的代码 —— 它必然通过正确性检查,于是
+    # 「模板必须失败」那条区分度检查会失去意义(空模板竟然能过 = 这题在放水)。
+    # 设了 required_grade 之后,「通过」= 正确性 + 评级达标,那条检查重新有效。
+    #
+    # 不设它时行为完全不变:性能只评级、不卡关(这是本框架的既定原则)。
+    required_grade: Optional[str] = None
 
     def grade_of(self, value: float) -> str:
         """把指标值映射到评级。从高到低取第一个达标者。"""
@@ -170,9 +179,21 @@ class Perf:
                 return letter
         return "C"
 
+    def meets(self, grade: Optional[str]) -> bool:
+        """评级是否达到 required_grade。未设门槛时恒为 True。"""
+        if not self.required_grade:
+            return True
+        if grade is None:
+            return False        # 拿不到评级 = 无法证明达标
+        return _GRADE_ORDER.get(grade, 0) >= _GRADE_ORDER.get(self.required_grade, 0)
+
     @property
     def is_bandwidth_metric(self) -> bool:
         return self.metric == "bandwidth"
+
+
+#: 评级的高低次序(用于 required_grade 的比较)
+_GRADE_ORDER = {"C": 1, "B": 2, "A": 3, "S": 4}
 
 
 @dataclass(frozen=True)
@@ -447,9 +468,29 @@ def parse_problem(raw: Dict[str, Any], root: Path) -> Problem:
         grades={str(k): float(v) for k, v in (praw.get("grades") or {}).items()},
         flush_l2=bool(praw.get("flush_l2", True)),
         bound=bound,
+        required_grade=(str(praw["required_grade"]).upper()
+                        if praw.get("required_grade") else None),
     )
     if perf.enabled and (perf.repeat < 1 or perf.warmup < 0):
         raise SpecError("perf.repeat 至少为 1,perf.warmup 不能为负")
+    if perf.required_grade:
+        # 设了通过门槛却没开性能评分,等于设了一个永远达不到的门槛
+        if not perf.enabled:
+            raise SpecError("perf.required_grade 需要 perf.enabled 为 true")
+        if perf.required_grade not in _GRADE_ORDER:
+            raise SpecError(
+                f"perf.required_grade={perf.required_grade!r} 不支持,"
+                f"可用:{' / '.join(sorted(_GRADE_ORDER, key=_GRADE_ORDER.get, reverse=True))}"
+            )
+        if not perf.grades:
+            raise SpecError("perf.required_grade 需要同时给出 perf.grades 才能评级")
+        # 门槛本身必须是 grades 里的一档 —— 否则可能是拼写错误,或设了一个
+        # 评不出来的等级(grade_of 只会返回 grades 里的档位或兜底的 C)
+        if perf.required_grade not in perf.grades and perf.required_grade != "C":
+            raise SpecError(
+                f"perf.required_grade={perf.required_grade} 但 grades 里没有这一档 "
+                f"({sorted(perf.grades)})—— 那样永远评不出达标"
+            )
 
     sraw = raw.get("sanitize") or {}
     race_case = sraw.get("racecheck_case")

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 SPEC_SCHEMA_PYTORCH = r"""
 ## spec.yaml 完整字段说明(PyTorch 科目)
@@ -341,6 +341,214 @@ WORKFLOW = r"""
 用一句话汇报:题目 id、考点、指标与门槛、实测数字。
 """
 
+SPEC_SCHEMA_CPP = r"""
+## spec.yaml 完整字段说明(C++ 优化题)
+
+```yaml
+id: cpp02-<名字>          # 必须与目录名一致。**前缀必须是 cpp**,不要用纯数字 ——
+                          # 各科目有各自的编号空间,数字部分重复会让 `leet test <n>`
+                          # 有歧义并直接失败(bank.resolve 对纯数字走前缀匹配)
+title: <中文标题>
+subject: cpp              # 必须写,否则会被当成 cuda 科目
+difficulty: 1..5
+tags: [<英文标签,如 cache loop-order>]
+concepts: [<中文考点,写给学习者看>]
+statement: problem.md
+
+# ---- 接口契约:决定 Ctx 的字段 ----
+buffers:
+  - name: <C 标识符>
+    dtype: f32 | f64 | i32 | i64 | u32 | u8
+    shape: [<参数名或整数字面量>]      # 空列表 [] 表示标量
+    role: in | out | scratch
+    fill: uniform | positive | randint | zero    # 仅 role=in 有效
+params:
+  - {name: <C 标识符>, dtype: i32 | ...}
+    # 标量参数。形状表达式里可以引用它们。浮点参数可以给小数(如 alpha: 0.5)
+
+entry:
+  function: <学习者要改快的那个函数名>
+    # 签名固定为 void f(Ctx& ctx) —— 框架按这个签名调用,不能改
+
+cases:
+  - {name: <用例名>, params: {<每个参数都给一个取值>}}
+    # 取值必须是正数;整数类型的参数必须是整数(会被用来算缓冲大小)
+
+verify:
+  atol: 1e-5      # 过宽会让错误实现轻松通过,框架会拒绝 atol>1.0 / rtol>0.1
+  rtol: 1e-4
+  repeat: 2       # 单线程 C++ 是确定性的,不必像 CUDA 那样重复很多次
+
+perf:
+  enabled: true           # required_grade 要求它为 true
+  bound: memory | compute
+  metric: bandwidth | speedup
+    #   优化题绝大多数用 speedup(相对基线快了多少倍)
+  repeat: 12              # ★ 不要用默认的 50!CPU 题动辄几十毫秒,
+                          #   50 次 + 10 次预热 = 几分钟白等。按基线实测耗时定:
+                          #   基线 80ms → repeat 12、warmup 3 就够取中位数了
+  warmup: 3
+  grades: {B: 3.0, A: 9.0, S: 13.0}   # 必须从实测倒推,见「工作流」
+  required_grade: B       # ★★ 优化题**必须**设,否则这道题是无效的
+    #   基线本身就是正确代码,不设它的话学习者把原代码原样交回来就算通过。
+    #   设了之后「正确性 + 评级达标」才算过,「模板必须失败」那条检查也才重新有效
+  flush_l2: true          # 默认开启,不要关
+
+sanitize:
+  memcheck: false         # cpp 科目暂未接入 ASan;写了 true 也会被跳过
+```
+
+## 运行环境(必须按这个来设计)
+
+- **编译选项由框架钉死**:`g++ -O3 -march=native -std=c++17`,**不带 `-ffast-math`**。
+  这个事实决定了很多题的可行性 —— 见下面「哪些缺陷真的有优化空间」
+- 计时用 `steady_clock`,调用是同步的,每次计时迭代前**清缓存**(读一遍 128MB)
+- **噪声地板 6–7%**(跨进程漂移;同进程内只差 1%,但机器忙时会明显变差)。
+  所以门槛之间至少要留 10% 的间隔
+- 单核 DRAM 带宽只有 ~30 GB/s。访存瓶颈的题在这个上限附近就会封顶
+- 学习者的函数被**反复调用**(稳定性重复 + 计时循环),所以不能依赖
+  "第一次调用时初始化"这类状态
+"""
+
+REQUIREMENTS_CPP = r"""
+## 硬性要求
+
+### reference.cpp —— 标准答案(oracle)
+- 只定义 `void reference(Ctx& ctx)`,用 `ctx.` 访问所有缓冲与参数
+- **必须完全正确**。它是判分的基准,写错了整道题就废了
+- 浮点累加请用 `double` 中间变量,保证接近真值
+- 不要写 `entry.function` 那个名字 —— 那是学习者的接口
+
+### baseline.cpp —— 性能基线(加速比的分母)
+- 必须定义 `void <entry.function>(Ctx& ctx)`
+- **必须正确**(框架会检查:基线与参考解在**所有**用例上必须一致)
+- **它就是那段"正确但有性能缺陷"的代码** —— 不是"故意写烂",而是
+  "照着定义直译、完全没考虑访存"的自然写法。学习者学到的是真实的经验判断
+
+### template.cpp —— 学习者拿到的起点
+- **必须与 baseline.cpp 是同一段代码**(可以有更详细的教学注释和 TODO)。
+  这一条是硬的:学习者的起点加速比必须正好是 1.00x。
+  如果你把模板写得和基线不一样,起点就不是 1.0x,整道题的语义就乱了
+- 注释要有教学价值:指出该往哪个方向想,但**不要写出答案**
+- 框架会检查「模板必须失败」—— 对优化题来说就是「模板达不到 required_grade」
+
+### optimal.cpp —— 参考解(★ 出题的关键)
+- 一份**能达到目标评级**的实现。它是"门槛物理可达"的唯一依据
+- 带注释讲清为什么这样写快、试过哪些死路
+- 卡住的学习者用 `leet solution <题号>` 看它
+
+### problem.md —— 题面
+- **中文**,面向会写 C++ 但没做过性能优化的人
+- 结构:题目描述 → 为什么这道题重要 → **慢在哪(要有实测数字)** →
+  解法思路(不要直接给完整代码)→ 陷阱 → 评分说明 → 3~4 个思考题
+- 解释要落到**物理原因**上(cache line 多大、步长是多少、为什么预取器失效),
+  不要只说「这样写更快」
+- **诚实**:如果某个"优化"实测下来没用甚至更慢,就直说 —— 那往往是最有价值
+  的一段。不要写你没验证过的断言
+- 「评分」一节要写明 `required_grade`:**这道题必须达到 X 级才算通过**,
+  以及为什么(基线本身正确,只看正确性的话交回原代码就算过)
+
+### cases
+- 至少一个用例大到可评级(基线耗时 ≥ 1ms 比较稳妥)
+- **必须包含边界用例**:非 2 的幂、质数规模
+- 但也要注意**别把用例开太大** —— 基线几十毫秒 × (repeat+warmup) 次
+  × 7 个变体,会让 `leet validate` 变得很慢
+"""
+
+WORKFLOW_CPP = r"""
+## 你该怎么做
+
+**这个科目与另外两个最大的不同:能不能出成题,必须先测量才知道。**
+
+> **不要通读框架源码**(`src/leetstudy/` 下的文件)。出题需要的 spec 格式、
+> 检查规则、约束都已经在上面写全了,源码里没有额外信息。花时间读它只会拖慢进度。
+> 想找题面和 spec 的写法参考,读 `problems/cpp01-matmul-loop-order/` 那一份就够了
+> —— 它是完整的范例,提示词末尾也整份附上了。
+
+### 第一步:先想清楚"这个缺陷到底有多少优化空间"(不要动笔)
+
+这是本科目唯一的硬性要求。实测下来,**「看起来像陷阱」和「真是陷阱」大约各占
+一半** —— 编译器在 `-O3 -march=native` 下已经自己处理掉了不少经典陷阱。
+下面这张表是实测结果,直接决定你的选题空间:
+
+| 缺陷类型 | 实测优化空间 | 说明 |
+|---|---|---|
+| 矩阵乘循环次序 `ijk`→`ikj` | **12–26x** | ✅ 首选题材 |
+| 矩阵乘分块(cache blocking) | **33x** | ✅ 编译器不会自动做 |
+| 归约单累加器 → 4 路独立累加 | **3.4x** | ✅ 无 fast-math 时编译器不许重排浮点 |
+| AoS → SoA(只取结构体部分字段) | **2.2x** | ✅ 编译器改不了你的数据布局 |
+| 虚函数 → 具体类型 / 去虚化 | **1.72x** | ⚠️ 幅度小,四档门槛会挤在一起 |
+| `std::function` 递归 → 泛型 lambda | **1.47x** | ⚠️ 同上 |
+| 补 `__restrict` | 1.1x | ❌ **编译器已经自己修了**(插运行时别名检查) |
+| `range-for` 的 `auto` 值拷贝 | **1.00x** | ❌ **编译器已经自己修了**(拷贝是死代码) |
+
+**因此:**
+- 优化空间 **> 2x** 才值得做成评级题(B/A/S 三档要拉开)
+- 1.2–1.7x 的那类不要做成评级题,除非你把它设计成**判断题**
+  (让学习者先猜瓶颈在哪,再用测量验证)
+- ≈1.0x 的直接放弃,换一个题材
+
+> 这张表是实测来的,不是推测。**不要想当然地认为某个东西慢** ——
+> 上一轮就有两个"经典陷阱"实测下来是 1.0x,编译器早就修好了。
+
+### 第二步:一口气写完 6 个文件
+1. `spec.yaml`(`required_grade` 先随便填一个偏高的目标,比如 `{B: 2.0, A: 5.0, S: 10.0}`,
+   等测出来再改)
+2. `reference.cpp`(CPU 参考解,double 累加)
+3. `baseline.cpp`(有缺陷但正确的实现)
+4. `template.cpp`(**与 baseline 同一段代码** + 教学注释)
+5. `optimal.cpp`(改好的版本)
+6. **`problem.md`(题面)** —— 一定要在这一步写完,不要留占位符。
+   `leet validate` 会检查题面至少 600 字符、有章节结构、含「思考题」
+
+### 第三步:测量,然后定门槛
+
+```bash
+leet validate cpp02        # 首次约 20~30 秒(要编译 7 个变体),之后缓存命中约 10 秒
+```
+
+它会打印基线耗时和**参考解实际拿到的评级与倍速**,例如:
+
+```
+✓  参考解能证明门槛可达    参考解达标:最好用例 square 16.19x,评级 S
+```
+
+拿到这个数字之后:
+- **门槛从实测倒推**:S ≈ 实测值的 75~80%,A ≈ 55~60%,B ≈ 20%
+  (不要卡到 90% —— CPU 侧噪声比 GPU 大,见下)
+- ★ **一定要用"最差值",不是典型值。** 同一份代码多测几次,并且**在机器忙的时候
+  也测一次**,拿最差的那个数来定。踩过这个坑:某题安静时稳定 16.2~16.9x,
+  按 90% 设了 S=14.5,结果一次带负载的运行里参考解只拿到 14.05x —— 于是 S
+  变成了「你挑了个机器空闲的时候测」。门槛要设在**即便机器忙也达得到**的位置
+- 把实测数字写进 spec.yaml 的注释里(照 `problems/cpp01-matmul-loop-order/spec.yaml`
+  的样子写)
+
+### 第四步:如果空间不够,换题材 —— 不要降低门槛
+
+如果 `leet validate` 报:
+
+```
+✗  参考解能证明门槛可达   参考解只拿到 C 级(1.12x)——
+                          说明门槛设高了,存在不了这样的实现
+```
+
+**这说明这个缺陷没有足够的优化空间,不是你门槛设错了。** 正确做法是**换一个
+题材**(回到第一步那张表挑一个 >2x 的),而不是把 grades 改成 `{B: 1.05, ...}`
+去迁就它 —— 那样出出来的是一道没有区分度的废题。
+
+### 第五步:确认区分度检查全绿
+
+`leet validate` 会注入 4 个必然错误的实现(空实现 / 全填 0 / 全填 1 / 只写首元素),
+每一个都必须被判失败。加上:
+- **模板必须失败** —— 对优化题来说就是「模板达不到 required_grade」
+  (模板 == 基线,加速比 1.00x,自然达不到 B)
+- **参考解能证明门槛可达** —— 参考解必须拿到 A 或 S
+
+### 最后
+用一句话汇报:题目 id、考点、指标与门槛、**实测数字**(基线耗时、参考解耗时、加速比)。
+"""
+
+
 REVIEW_PROMPT = r"""你是一位 CUDA 教学助手。下面是一个学习者对某道刷题题的解答,以及框架给出的
 判题数据。请给出**针对这份代码**的讲评。
 
@@ -360,14 +568,80 @@ REVIEW_PROMPT = r"""你是一位 CUDA 教学助手。下面是一个学习者对
 DEFAULT_EXAMPLE = {
     "cuda": "01-vector-add",
     "pytorch": "py01-softmax-dim0",
+    "cpp": "cpp01-matmul-loop-order",
 }
+
+#: 各科目的范例文件。范例里必须带上参考解(`optimal.*`)—— 否则出题者只能从
+#: 文字描述猜它该长什么样,而"照着范例做"比"照着说明做"可靠得多。
+EXAMPLE_FILES = {
+    "cuda": ("spec.yaml", "reference.cpp", "baseline.cu", "template.cu", "optimal.cu"),
+    "pytorch": ("spec.yaml", "reference.py", "baseline.py", "template.py", "optimal.py"),
+    "cpp": ("spec.yaml", "reference.cpp", "baseline.cpp", "template.cpp", "optimal.cpp"),
+}
+
+#: 已经写好出题提示词的科目。**注册科目 ≠ 能出题** ——
+#: `subjects.available()` 里有什么,和这里有什么,是两件事。
+#: 加了科目却忘了加提示词的话,出题会拿到错误的那套说明并产出格式错乱的题目,
+#: 所以 `_blocks()` 对未知科目直接抛错,而不是回落到 CUDA。
+AUTHORABLE = ("cuda", "pytorch", "cpp")
+
+
+def supports(subject: str) -> bool:
+    """这个科目能自动出题吗?"""
+    return subject in AUTHORABLE
+
+
+#: 从需求原文里认出科目的关键词。**故意只收明确无歧义的字面量** ——
+#: 这个函数的用途是「拦下明显搞错的情况」,不是「智能判断科目」。
+#: 误报的代价是用户白跑一次(加个 flag),所以宁可漏,不可错。
+_SUBJECT_SIGNALS = (
+    # 先看 pytorch:它点名了框架本身,是最强的信号。
+    # 「pytorch 自定义 CUDA 算子」这种同时含 cuda 字样的需求,科目仍然是 pytorch,
+    # 所以它必须排在 cuda 前面。
+    ("pytorch", ("pytorch", "torch")),
+    # cuda 的典型说法。「用 C++ 写 CUDA kernel」同时含 c++ 与 kernel,该判 cuda。
+    ("cuda", ("cuda", "kernel", "核函数", "shared memory", "共享内存",
+              "__syncthreads", "线程块", "网格", "blockdim", "griddim")),
+    # cpp 优化题的说法
+    ("cpp", ("c++", "cpp", "编译器优化", "cache line", "循环次序", "访存模式")),
+)
+
+
+def suggest_subject(requirement: str) -> Optional[str]:
+    """从需求原文猜科目。认不出来返回 None。
+
+    只按 `_SUBJECT_SIGNALS` 的顺序取**第一个**命中的科目 —— 这是有意的优先级,
+    不是打分:命中了就返回,不比较命中次数。
+    """
+    text = (requirement or "").lower()
+    for subject, words in _SUBJECT_SIGNALS:
+        if any(w in text for w in words):
+            return subject
+    return None
 
 
 def _blocks(subject: str):
-    """按科目选对应的三块提示词。"""
+    """按科目选对应的三块提示词。
+
+    **不做静默回落。** 早先这里是「是 pytorch 就返回 pytorch 那套,否则返回
+    CUDA 那套」—— 于是 `leet new --subject cpp` 会拿到 CUDA 的说明:
+    模型被告知「学习者写 kernel 与启动配置」,然后产出一堆 .cu 文件。
+    这比直接报错更糟 —— 它看起来是支持的。
+    """
     if subject == "pytorch":
         return SPEC_SCHEMA_PYTORCH, REQUIREMENTS_PYTORCH, WORKFLOW_PYTORCH
-    return SPEC_SCHEMA, REQUIREMENTS, WORKFLOW
+    if subject == "cpp":
+        return SPEC_SCHEMA_CPP, REQUIREMENTS_CPP, WORKFLOW_CPP
+    if subject == "cuda":
+        return SPEC_SCHEMA, REQUIREMENTS, WORKFLOW
+    raise ValueError(
+        f"{subject!r} 科目还没有出题提示词(可用:{' / '.join(AUTHORABLE)})。\n"
+        f"科目本身能用(可以手写题目、leet test / validate 都正常),"
+        f"只是还不能让本地 claude 自动出题。\n"
+        f"要支持的话,照 prompts.py 里 PyTorch 那套加三块:"
+        f"SPEC_SCHEMA_{subject.upper()} / REQUIREMENTS_{subject.upper()} / "
+        f"WORKFLOW_{subject.upper()},并登记进 AUTHORABLE。"
+    )
 
 
 def build_author_prompt(requirement: str, root: Path, subject: str = "cuda",
@@ -386,12 +660,7 @@ def build_author_prompt(requirement: str, root: Path, subject: str = "cuda",
     schema, requirements, workflow = _blocks(subject)
     example_id = example_id or DEFAULT_EXAMPLE.get(subject, "01-vector-add")
     example_dir = root / "problems" / example_id
-    # 范例里必须带上参考解 —— 否则出题者只能从文字描述猜它该长什么样,
-    # 而"照着范例做"比"照着说明做"可靠得多。
-    example_files = ("spec.yaml", "reference.py", "baseline.py", "template.py",
-                     "optimal.py") \
-        if subject == "pytorch" else \
-        ("spec.yaml", "reference.cpp", "baseline.cu", "template.cu", "optimal.cu")
+    example_files = EXAMPLE_FILES.get(subject, EXAMPLE_FILES["cuda"])
     example_text = ""
     for fname in example_files:
         f = example_dir / fname
@@ -406,12 +675,18 @@ def build_author_prompt(requirement: str, root: Path, subject: str = "cuda",
             + "\n"
         )
 
-    subject_line = (
-        "**本批题目属于 `pytorch` 科目** —— 学习者用 Python 写 `forward(ctx)`,"
-        "不需要写 CUDA。"
-        if subject == "pytorch" else
-        "**本批题目属于 `cuda` 科目** —— 学习者写 kernel 与启动配置。"
-    )
+    subject_line = {
+        "pytorch": (
+            "**本批题目属于 `pytorch` 科目** —— 学习者用 Python 写 `forward(ctx)`,"
+            "不需要写 CUDA。"
+        ),
+        "cpp": (
+            "**本批题目属于 `cpp` 科目,而且是「优化题」** —— 基线和模板本身就是"
+            "**完全正确**的代码,学习者要做的是把它**改快**。所以 `perf.required_grade` "
+            "必须设,而且门槛必须从实测倒推。这是本科目与另外两个最根本的差别。"
+        ),
+        "cuda": "**本批题目属于 `cuda` 科目** —— 学习者写 kernel 与启动配置。",
+    }.get(subject, "**本批题目属于 `cuda` 科目** —— 学习者写 kernel 与启动配置。")
 
     # `leet new --count N` 是逐道开独立会话的。学习者的需求原文里往往写着
     # 「出三道…」,如果不明确约束,每个会话都会去尝试出完全部 N 道 ——
@@ -423,7 +698,7 @@ def build_author_prompt(requirement: str, root: Path, subject: str = "cuda",
         if only_one else ""
     )
 
-    return f"""你是一位 CUDA / PyTorch 教学专家,正在为一个「LeetCode 式的刷题框架」出题。
+    return f"""你是一位 CUDA / PyTorch / C++ 性能教学专家,正在为一个「LeetCode 式的刷题框架」出题。
 
 # 学习者的需求
 
@@ -434,8 +709,10 @@ def build_author_prompt(requirement: str, root: Path, subject: str = "cuda",
 {subject_line}
 
 在 `problems/<新题id>/` 目录下产出 5 个文件:spec.yaml / problem.md / template /
-reference / baseline(扩展名随科目:PyTorch 是 `.py`,CUDA 是 `.cu` / `.cpp`)。
-id 用小写短横线风格并带序号前缀。
+reference / baseline,外加**参考解 `optimal`**(详见下面的工作流)。
+扩展名随科目:PyTorch 是 `.py`,CUDA 是 `.cu` / `.cpp`,C++ 优化题统一是 `.cpp`。
+id 用小写短横线风格;**前缀随科目**(CUDA 用纯数字如 `08-foo`,PyTorch 用
+`py05-foo`,C++ 用 `cpp02-foo`)—— 各科目有各自的编号空间,不要共用数字序列。
 {scope_line}
 
 {schema}
@@ -448,13 +725,35 @@ id 用小写短横线风格并带序号前缀。
 
 # 开始
 
-记住三个最容易出错的地方:
-1. **用例太小** → 性能评分完全落空(必须有一个用例大到可评级)
-2. **门槛物理不可达** → 评级形同虚设(先测量再定门槛)
-3. **模板能通过测试** → 这道题没有意义(空模板必须失败)
+{_closing(subject)}
 
 现在开始。完成后运行 `leet validate <id>` 确认全部通过。
 """
+
+
+#: 收尾处反复强调的三个坑。**按科目分开写** —— 三个科目的失败模式不一样:
+#: CUDA 怕模板放水,优化题怕"缺陷其实没有优化空间"却硬把门槛调低,
+#: PyTorch 怕标注错误。
+_CLOSING = {
+    "cuda": """记住三个最容易出错的地方:
+1. **用例太小** → 性能评分完全落空(必须有一个用例大到可评级)
+2. **门槛物理不可达** → 评级形同虚设(先测量再定门槛)
+3. **模板能通过测试** → 这道题没有意义(空模板必须失败)""",
+    "pytorch": """记住三个最容易出错的地方:
+1. **用例太小** → 性能评分完全落空(必须有一个用例大到可评级)
+2. **门槛物理不可达** → 评级形同虚设(先测量再定门槛)
+3. **模板能通过测试** → 这道题没有意义(空模板必须失败)""",
+    "cpp": """记住三个最容易出错的地方:
+1. **缺陷其实没有优化空间** → 实测空间不到 2x 就**换题材**,不要靠调低门槛迁就它。
+   实测过一半的"经典陷阱"在 `-O3` 下是假的(编译器早就修好了)
+2. **模板和基线不是同一段代码** → 学习者的起点就不是 1.00x,语义乱掉
+3. **没设 `perf.required_grade`** → 基线本身就是正确代码,不设的话把原代码
+   原样交回来就算通过,这道题是废的""",
+}
+
+
+def _closing(subject: str) -> str:
+    return _CLOSING.get(subject, _CLOSING["cuda"])
 
 
 def build_review_prompt(problem_id: str, title: str, statement: str, solution_src: str,

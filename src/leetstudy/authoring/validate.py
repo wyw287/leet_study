@@ -147,9 +147,12 @@ def validate_problem(cfg: Config, problem: Problem) -> List[Check]:
     checks.append(_optimal_check(subject, problem, build_root, baseline_results, cfg))
 
     # ---- 6. 模板与劣化解必须被判失败(区分度检查)----
-    checks.append(_template_check(subject, problem, build_root))
+    #   优化题(设了 required_grade)走的是「正确性 + 评级达标」判据 ——
+    #   因为它的模板就是那段正确但慢的代码,只看正确性必然通过。
+    checks.append(_template_check(subject, problem, build_root, cfg, baseline_results))
     for kind in subject.mutants(problem):
-        checks.append(_mutant_check(subject, problem, build_root, kind))
+        checks.append(_mutant_check(subject, problem, build_root, kind, cfg,
+                                    baseline_results))
 
     return checks
 
@@ -193,15 +196,7 @@ def _optimal_check(subject, problem: Problem, build_root: Path,
     )
 
     # 复用**判分时那套**评分逻辑,不另写一份 —— 否则两处算法会漂移
-    from ..judge import CaseVerdict, Verdict, score_verdict
-    verdict = Verdict(problem=problem)
-    for r in results:
-        verdict.cases.append(CaseVerdict(
-            case=r.case, ok=r.ok, result=r,
-            baseline=baseline_results.get(r.case),
-            repeats=r.verify_total, repeats_ok=r.verify_pass,
-        ))
-    score_verdict(cfg, problem, verdict)
+    verdict = _score_build(problem, results, cfg, baseline_results)
 
     failed = [c.case for c in verdict.cases if not c.ok]
     if failed:
@@ -221,9 +216,16 @@ def _optimal_check(subject, problem: Problem, build_root: Path,
                         if pct is not None else f"{best.metric_value:.0f} GB/s")
         else:
             measured = f"{best.metric_value:.2f}x"
-    if grade in ("S", "A"):
+    if grade in ("S", "A") and problem.perf.meets(grade):
+        extra = ("(本题要求 " + problem.perf.required_grade + " 级)"
+                 if problem.perf.required_grade else "")
         return (name, True, f"参考解达标:最好用例 {best.case if best else '?'} "
-                            f"{measured},评级 {grade}")
+                            f"{measured},评级 {grade}{extra}")
+    if not problem.perf.meets(grade):
+        return (name, False,
+                f"参考解只拿到 {grade} 级({measured}),而本题要求 "
+                f"{problem.perf.required_grade} 级才算通过 —— 没有参考解能达标,"
+                f"门槛设高了;请按实测下调 perf.grades")
     return (name, False,
             f"参考解只拿到 {grade} 级({measured})—— 说明门槛设高了,"
             f"存在不了这样的实现;请按实测下调 perf.grades,或改进 {fname}")
@@ -233,26 +235,82 @@ def _solution_ext(subject: Subject) -> str:
     return Path(subject.solution_filename).suffix or ".txt"
 
 
-def _run_cases(subject: Subject, artifact, problem: Problem,
+def _run_cases(subject, problem, artifact, cfg, baseline_results,
                cases=None) -> Tuple[bool, str]:
-    """跑若干用例,返回 (是否全部通过, 说明)。
+    """这份实现算不算「通过」?返回 (是否通过, 说明)。
+
+    判据必须与 `judge` 完全一致 —— 否则区分度检查会在优化题上悄悄失效:
+
+    * **普通题**:只看正确性(性能只评级不卡关)。空模板必然写不对输出,
+      所以「模板必须失败」这条检查是有效的。
+    * **优化题**(设了 `perf.required_grade`):模板就是那段**正确但慢**的代码,
+      只看正确性的话它必然通过 —— 检查形同虚设。所以这里要按同一套判据
+      连性能一起算:正确性 + 评级达标。模板 == 基线,加速比约 1.0,
+      自然达不到 B 级,检查重新有效。
 
     cases 为 None 时跑全部;区分度检查只传最小用例 ——
     那些检查只关心「劣化解会不会失败」,能在一个小用例上失败就足以证明
     测试有区分度,没必要为它跑上千万个元素的大用例。
+    但优化题例外:小用例不参与评级,必须跑**能评级**的那个用例才判得出来。
     """
-    targets = problem.cases if cases is None else list(cases)
-    passed: List[str] = []
-    for case in targets:
-        r = subject.run_case(artifact, case.name, perf=False)
-        if r.ok:
-            passed.append(case.name)
-    if not passed:
-        return False, f"在 {len(targets)} 个用例上都被判失败"
-    return True, f"竟然通过了这些用例:{', '.join(passed)}"
+    needs_grade = bool(problem.perf.required_grade) and problem.perf.enabled
+    targets = list(problem.cases) if cases is None else list(cases)
+
+    # 先不计时地跑一遍:正确性不对就直接算失败,没必要付计时的代价。
+    # 四个劣化解全都在这一步被拦下 —— 它们只需要跑最小用例就露馅,
+    # 所以「劣化解必须失败」这组检查几乎是免费的。
+    results = subject.run_all_cases(
+        artifact, [c.name for c in targets], perf=False, verify_repeat=1,
+    )
+    bad = [r.case for r in results if not r.ok]
+    if bad or not results:
+        why = f"正确性没过:{', '.join(bad)}" if bad else "没有拿到结果"
+        return False, f"在 {len(results)} 个用例上被判失败({why})"
+
+    if not needs_grade:
+        passed = [r.case for r in results if r.ok]
+        return True, f"竟然通过了这些用例:{', '.join(passed)}"
+
+    # 正确性过了才计时。计时必须跑**全部**用例 —— 评级取所有用例里最好的那次,
+    # 只跑最小用例会把它误判成「不达标」。
+    # 优化题的模板就是那段正确但慢的代码,会一路走到这里。
+    graded = subject.run_all_cases(
+        artifact, [c.name for c in problem.cases], perf=True, verify_repeat=1,
+    )
+    verdict = _score_build(problem, graded, cfg, baseline_results)
+    if verdict.passed:
+        return True, (f"竟然达标了({verdict.grade} 级)—— "
+                      f"这道题要求 {problem.perf.required_grade} 级")
+    return False, (f"正确但只拿到 {verdict.grade or '无法评级'} 级,"
+                   f"没到要求的 {problem.perf.required_grade} 级")
 
 
-def _template_check(subject: Subject, problem: Problem, build_root: Path) -> Check:
+def _score_build(problem: Problem, results: List[Any], cfg: Config,
+                 baseline_results: Optional[Dict[str, Any]] = None):
+    """把一组用例结果按**判题时那套**评分逻辑算成 Verdict。
+
+    刻意复用 `judge.score_verdict` 而不是另写一份 —— 否则两处算法会漂移,
+    表现是「validate 说这道题的门槛可达,但学习者怎么都刷不到那个评级」。
+    """
+    from ..judge import CaseVerdict, Verdict, score_verdict
+    verdict = Verdict(problem=problem)
+    for r in results:
+        verdict.cases.append(CaseVerdict(
+            case=r.case, ok=r.ok, result=r,
+            baseline=(baseline_results or {}).get(r.case),
+            repeats=r.verify_total, repeats_ok=r.verify_pass,
+        ))
+    score_verdict(cfg, problem, verdict)
+    verdict.passed = bool(verdict.cases) and not verdict.failed_cases
+    if verdict.passed and problem.perf.required_grade:
+        if not problem.perf.meets(verdict.grade):
+            verdict.passed = False
+            verdict.grade_short = True
+    return verdict
+
+
+def _template_check(subject: Subject, problem: Problem, build_root: Path,
+                    cfg: Config, baseline_results: Dict[str, Any]) -> Check:
     name = "模板必须失败"
     build = subject.prepare_variant(
         problem, problem.root / subject.template_filename, build_root, "chk_template"
@@ -260,14 +318,15 @@ def _template_check(subject: Subject, problem: Problem, build_root: Path) -> Che
     if not build.ok:
         # 模板准备失败也算「失败」,但更可能是模板本身有语法问题,标出来
         return (name, True, "模板无法通过准备阶段(当作失败处理,但建议检查模板语法)")
-    ok, detail = _run_cases(subject, build.artifact, problem, [problem.smallest_case])
+    ok, detail = _run_cases(subject, problem, build.artifact, cfg, baseline_results,
+                            [problem.smallest_case])
     if ok:
         return (name, False, f"⚠️ 空模板竟然能通过 —— {detail}。这道题在放水!")
-    return (name, True, "模板被判失败,符合预期")
+    return (name, True, f"模板被判失败,符合预期({detail})")
 
 
 def _mutant_check(subject: Subject, problem: Problem, build_root: Path,
-                  kind: str) -> Check:
+                  kind: str, cfg: Config, baseline_results: Dict[str, Any]) -> Check:
     name = f"劣化解必须失败:{kind}"
     source = subject.mutants(problem).get(kind)
     if source is None:
@@ -282,7 +341,8 @@ def _mutant_check(subject: Subject, problem: Problem, build_root: Path,
         return (name, False,
                 "劣化解无法通过准备阶段,检查无法完成:"
                 + " / ".join(build.log.splitlines()[:2]))
-    ok, detail = _run_cases(subject, build.artifact, problem, [problem.smallest_case])
+    ok, detail = _run_cases(subject, problem, build.artifact, cfg, baseline_results,
+                            [problem.smallest_case])
     if ok:
         doc = subject.mutant_docs.get(kind, kind)
         return (name, False, f"⚠️ {doc} —— 但它通过了。{detail}")

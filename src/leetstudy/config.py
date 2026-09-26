@@ -286,6 +286,9 @@ class Config:
     root: Path
     nvcc: str = "nvcc"
     sanitizer: str = "compute-sanitizer"
+    #: C++ 科目的编译器(cpp 科目用,与 nvcc 无关)。默认 g++。
+    #: 编译选项由 `subjects/cpp.py` 钉死,这里只换编译器本体。
+    cxx: str = "g++"
     claude_bin: str = "claude"
     #: 目标架构。**惰性求值** —— 探测它要跑 nvidia-smi,而本机实测每次要 4 秒;
     #: 可是 `leet list` / `show` / `start` 这些命令压根不需要它。
@@ -382,6 +385,7 @@ def load_config(root: Optional[Path] = None) -> Config:
 
     cfg.nvcc = env("NVCC") or str(raw.get("nvcc") or cfg.nvcc)
     cfg.sanitizer = env("SANITIZER") or str(raw.get("sanitizer") or cfg.sanitizer)
+    cfg.cxx = env("CXX") or str(raw.get("cxx") or cfg.cxx)
     cfg.claude_bin = env("CLAUDE_BIN") or str(raw.get("claude_bin") or cfg.claude_bin)
     # 架构留空 → 惰性探测;只有显式配置时才在这里定下来
     explicit_arch = env("ARCH") or raw.get("arch")
@@ -389,7 +393,7 @@ def load_config(root: Optional[Path] = None) -> Config:
     cfg.claude_model = env("CLAUDE_MODEL") or raw.get("claude_model") or None
 
     # 路径类设置:相对路径按仓库根解析
-    for attr in ("nvcc", "sanitizer", "claude_bin"):
+    for attr in ("nvcc", "sanitizer", "cxx", "claude_bin"):
         value = getattr(cfg, attr)
         if "/" in value:
             p = Path(value).expanduser()
@@ -477,6 +481,19 @@ def doctor(cfg: Config) -> List[Check]:
         checks.append(Check(
             "GPU", False, "nvidia-smi 不可用或未检测到 GPU",
             "确认驱动安装、容器有 --gpus 权限",
+        ))
+
+    # C++ 编译器(cpp 科目的优化题要用)。缺了不影响 CUDA / PyTorch 题。
+    cxx_path = shutil.which(cfg.cxx) or (cfg.cxx if Path(cfg.cxx).is_file() else None)
+    if cxx_path:
+        code, out = _run([cxx_path, "--version"])
+        ver = out.splitlines()[0].strip() if code == 0 and out else ""
+        checks.append(Check("C++ 编译器", True, f"{cxx_path}  {ver}".strip()))
+    else:
+        checks.append(Check(
+            "C++ 编译器", False, f"未找到 {cfg.cxx!r}",
+            "安装 g++/clang++,或设置 LEETSTUDY_CXX=/path/to/g++;"
+            "缺失只影响 cpp 科目的优化题",
         ))
 
     # compute-sanitizer

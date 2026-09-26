@@ -2,12 +2,13 @@
 
 把一个知识点拆成一道道有判分的题,让你只写**核心的那几行**,剩下的自动完成。
 
-目前支持两个科目:
+目前支持三个科目:
 
 | 科目 | 你写什么 | 题号前缀 |
 |---|---|---|
 | **CUDA** | kernel + 启动配置(数据分配/搬运/计时/对拍/越界检查全自动) | `01-` `02-` … |
 | **PyTorch** | 一个 `forward(ctx)`(用 torch 算子,或写自定义 CUDA 算子) | `py01-` … |
+| **C++(优化题)** | 把给定代码**改快** —— 基线本身就是正确代码 | `13-` … |
 
 ```
 $ leet test 01
@@ -91,7 +92,7 @@ $EDITOR solutions/01-vector-add/solution.cu
 | `leet bench [题号] [--repeat N]` | 只测性能,重复更多次 |
 | `leet review [题号] [--fresh]` | 让本地 claude 讲评你的 kernel |
 | `leet solution [题号]` | **看参考解** —— 一份能达到目标评级的实现 |
-| `leet new "<需求>" [--subject pytorch] [--count N]` | 让本地 claude 自动出题(含自验证与修复回路) |
+| `leet new "<需求>" [--subject cuda\|pytorch\|cpp] [--count N]` | 让本地 claude 自动出题(含自验证与修复回路) |
 | `leet validate [--all\|<题号>]` | 题库健康检查 |
 | `leet stats` | 学习进度看板 |
 | `leet clean` | 清理编译产物 |
@@ -187,7 +188,8 @@ leet solution 05        # 省略题号则取最近编辑过的解答
 | `leet test`(源码未变,编译缓存命中) | ~11 s |
 | `leet validate <题号>` | 实测:CUDA 题 ~40 s;PyTorch 题 ~85 s(原因见下) |
 | `leet validate --all` | 实测 ~4.7 分钟(6 道题)—— 改框架后应当跑它 |
-| `leet new` | 20–40 分钟 |
+| `leet new`(CUDA / PyTorch 题) | 20–40 分钟 |
+| `leet new --subject cpp` | 实测 **约 8 分钟** —— CPU 题编译快、迭代快 |
 
 > **为什么 PyTorch 题的 validate 反而比 CUDA 题慢**(85s vs 40s),尽管它不需要编译?
 > 因为区分度检查要跑 **6 个变体**(基线 + 模板 + 4 个劣化解),每个都是一次独立的
@@ -257,6 +259,7 @@ baseline.cu ──→ 同一个 harness 再编译一次 ──────→ �
 leet new "出一道关于 bank conflict 的题"
 leet new --count 3 "关于 bank conflict 的题,难度递进"
 leet new --subject pytorch "出一道 LayerNorm 的题"
+leet new --subject cpp "出一道 C++ 优化题,主题是归约求和的性能"
 ```
 
 本地 claude 会读完 spec 格式说明 + 一道已通过的范例,自己写文件、编译、跑
@@ -284,6 +287,7 @@ leet new --subject pytorch "出一道 LayerNorm 的题"
 |---|---|---|---|---|
 | `cuda` | `.cu` 里的 kernel + 启动配置 | nvcc 编译 | memcheck / racecheck | `01-` |
 | `pytorch` | `.py` 里的 `forward(ctx)` | 语法预检(无需编译) | 可选(仅自定义算子题需要) | `py01-` |
+| `cpp` | `.cpp` 里改快一个**已正确**的函数 | g++ 编译 | 暂未接入 ASan | `13-` |
 
 **用户接口各科目不同,但判题数据格式完全一致** —— 报告层与诊断层不区分科目。
 
@@ -311,6 +315,39 @@ def forward(ctx):
 
 判题用的是 **CPU 上的纯 torch 参考解**(与 CUDA 侧同理:oracle 不能在 GPU 上
 自己引入竞态/越界),计时用 `torch.cuda.Event`,每次迭代前同样清 L2。
+
+### C++ 科目:优化题
+
+```yaml
+subject: cpp
+entry:
+  function: matmul           # 你要改快的那个函数
+perf:
+  required_grade: B          # ★ 正确性 + 评级达标才算「通过」
+```
+
+这个科目和前两个**性质不同**:它的基线本身就是**完全正确的**代码,题目问的是
+「把它改快」。所以它多了一条规则 —— `perf.required_grade`。
+
+没有它的话,学习者把原代码原样交回来就算通过。有了它:
+
+```
+$ leet test cpp01       # 还没做任何优化
+判定   ✗ 未通过
+       正确性没问题,但这道题要求性能达到 B 级 —— 目前是 C 级。
+       这是一道优化题:把同一件事做得更快才是它的目标。
+```
+
+**没设这个字段的题行为一字未变** —— 性能仍然只评级、不卡关。
+
+编译选项(`-O3 -march=native`,**不带** `-ffast-math`)由框架钉死,改它不算数。
+理由见 [`docs/design.md`](docs/design.md) 第八节:实测同一个 `-ffast-math`
+能让一份没改过的源码白拿 4 倍。
+
+> 这个科目能做的前提是「候选缺陷必须先实测」。实测下来,「看起来像陷阱」和
+> 「真是陷阱」大约各占一半 —— 比如 `__restrict`(1.1x)和 `range-for` 值拷贝
+> (1.00x)在 `-O3` 下编译器**已经自己修了**,而出题时凭直觉是看不出来的。
+> 完整实测表在 `docs/design.md` 第八节。
 
 ### 加一个新科目
 
@@ -395,9 +432,11 @@ build/             编译产物(可 leet clean 清掉)
   `nvidia-smi` 单次 4.3 秒。框架已经据此做了缓存与进程合并(`leet test` 从 49 秒
   降到 11–21 秒),但**任何新增的「每个用例起一个进程」路径都会立刻退化**。
   详见 [`docs/design.md`](docs/design.md) 第六节。
-- **只支持 `cuda` 与 `pytorch` 两个科目**。判题层已经抽象好了
+- **只支持 `cuda` / `pytorch` / `cpp` 三个科目**。判题层已经抽象好了
   (`subjects/base.py` 的 `Subject` 基类 + `Artifact` 句柄),加 Triton 只需复用
   PyTorch 科目的 runner。见 [`docs/design.md`](docs/design.md) 第七节。
+- **`cpp` 科目暂未接入 ASan/UBSan**(它需要另编一份带 `-fsanitize` 的产物,
+  与 CUDA 侧的 compute-sanitizer 不是一回事)。哨兵区仍然有效,能抓越界写。
 - **`--race`(racecheck)很慢**,只在小用例上跑。默认只在检测到「同一输入重复跑
   结果不一致」这个竞态特征时才自动触发。
 - **PyTorch 科目没有哨兵区**(除非解答选择写进 `ctx.out`)。纯 PyTorch 算子不可能

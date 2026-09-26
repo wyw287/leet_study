@@ -81,6 +81,8 @@ class Verdict:
     fatal: Optional[str] = None
     seconds: float = 0.0
     solution_src: Optional[Path] = None
+    #: 正确性过了但没达到 perf.required_grade —— 只有「优化题」会置位
+    grade_short: bool = False
 
     @property
     def failed_cases(self) -> List[CaseVerdict]:
@@ -365,6 +367,15 @@ def judge(
         and not verdict.unstable_cases
     )
 
+    # 例外:设了 perf.required_grade 的「优化题」。
+    # 这类题的基线本身就是正确代码,题目问的是「把它改快」—— 只看正确性的
+    # 话,把原代码原样交回来就算通过。所以它额外要求性能达标。
+    # 没有设这个字段的题(其余全部)行为完全不变:性能只评级、不卡关。
+    if verdict.passed and problem.perf.required_grade:
+        if not problem.perf.meets(verdict.grade):
+            verdict.passed = False
+            verdict.grade_short = True
+
     # ---- 5. 消毒检查 ----
     if do_sanitize and subject.supports_sanitize:
         smallest = problem.smallest_case.name
@@ -454,12 +465,18 @@ def _collect_hints(problem: Problem, verdict: Verdict) -> List[str]:
                 diagnostics.describe_outputs(problem, cv.result, case_name=cv.case)
             )
 
-    # 不稳定 —— 竞态特征
+    # 不稳定 —— 竞态特征(各科目成因不同,别把 CUDA 的说法套到别的科目上)
     for cv in verdict.unstable_cases:
+        if problem.subject == "cuda":
+            why = "检查共享内存/全局内存的读写是否需要 __syncthreads()。"
+        elif problem.subject == "cpp":
+            why = ("检查有没有读未初始化的内存、或把上一次调用的结果留在了"
+                   "静态/全局变量里(框架会重复调用同一个函数)。")
+        else:
+            why = "检查有没有用到未初始化的张量,或依赖了不确定的执行顺序。"
         hints.append(
             f"用例 {cv.case} 重复 {cv.repeats} 次中只对了 {cv.repeats_ok} 次 —— "
-            f"结果不稳定,几乎可以断定是竞态或读了未初始化的内存。"
-            f"检查共享内存/全局内存的读写是否需要 __syncthreads()。"
+            f"结果不稳定,几乎可以断定是竞态或读了未初始化的内存。{why}"
         )
 
     # 消毒检查
@@ -469,10 +486,17 @@ def _collect_hints(problem: Problem, verdict: Verdict) -> List[str]:
     # 结果对了但很慢
     for cv in verdict.cases:
         if cv.ok and cv.speedup is not None and cv.speedup < 0.7:
+            if problem.subject == "cuda":
+                why = ("基线只是最朴素的写法,慢于它通常意味着访存模式有问题"
+                       "(比如跨步访问破坏了合并,或者线程利用率太低)。")
+            elif problem.subject == "cpp":
+                why = ("基线只是最直白的写法,慢于它通常意味着访存模式变差了"
+                       "(比如引入了跨步访问、或者多做了不必要的拷贝)。")
+            else:
+                why = ("基线只是最直白的写法,慢于它通常意味着多做了活"
+                       "(比如中间张量被反复物化、或者引入了多余的同步点)。")
             hints.append(
-                f"用例 {cv.case}:你的实现比基线还慢 {1/cv.speedup:.2f}x。"
-                f"基线只是最朴素的写法,慢于它通常意味着访存模式有问题"
-                f"(比如跨步访问破坏了合并,或者线程利用率太低)。"
+                f"用例 {cv.case}:你的实现比基线还慢 {1/cv.speedup:.2f}x。{why}"
             )
 
     # 去重保序

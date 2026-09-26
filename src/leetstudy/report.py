@@ -109,6 +109,16 @@ def render_verdict(
         console.print(line)
     else:
         console.print(Text("判定   ✗ 未通过", style="bold red"))
+        if verdict.grade_short:
+            # 优化题专用的失败原因:代码是对的,只是不够快
+            req = verdict.problem.perf.required_grade
+            got = verdict.grade or "无法评级"
+            console.print(
+                f"       正确性没问题,但这道题要求性能达到 "
+                f"[bold]{req}[/bold] 级 —— 目前是 [bold]{got}[/bold] 级。"
+            )
+            console.print("       [dim]这是一道优化题:把同一件事做得更快才是它的目标。"
+                          "卡住了可以用 `leet solution` 看参考解。[/dim]")
     console.print()
 
 

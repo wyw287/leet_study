@@ -5,12 +5,14 @@
 """
 from __future__ import annotations
 
+import re
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import click
+from click.core import ParameterSource
 from rich.console import Console
 
 from . import bank, report, subjects
@@ -349,6 +351,41 @@ def new(ctx: click.Context, requirement: tuple, subject: str, count: int,
     cfg = ctx.obj["cfg"]
     req = " ".join(requirement)
 
+    # 能判题 ≠ 能出题。科目注册进 subjects/_REGISTRY 之后,`--subject` 就会
+    # 接受它;但如果没有对应的出题提示词,模型会拿到**另一套**说明并产出
+    # 格式错乱的题目(`--subject cpp` 曾经会静默走 CUDA 那套)。
+    # 在开始之前就拦住,别等跑完一轮才发现。
+    if not prompts.supports(subject):
+        console.print(f"[red]{subject} 科目还不支持自动出题[/red]")
+        console.print(
+            f"[dim]已支持:{' / '.join(prompts.AUTHORABLE)}。"
+            f"{subject} 科目本身是可用的 —— 题可以手写,"
+            f"`leet test` / `leet bench` / `leet solution` / `leet validate` 都正常,"
+            f"只是还不能让本地 claude 自动出。[/dim]"
+        )
+        sys.exit(1)
+
+    # 「没指定科目」时默认是 cuda,而且**需求原文不参与判断** —— 于是
+    # `leet new "出一道 pytorch 的题"` 会安静地产出一道 CUDA 题,
+    # 25~40 分钟后才发现。这里在开始之前对着需求原文核一遍。
+    #
+    # 只在**没显式指定**时才拦:显式写了 `--subject cuda` 的人知道自己要什么
+    # (哪怕需求里提到 pytorch,比如「用 CUDA 加速 pytorch 的瓶颈算子」)。
+    if ctx.get_parameter_source("subject") is ParameterSource.DEFAULT:
+        guess = prompts.suggest_subject(req)
+        if guess is not None and guess != subject:
+            console.print(
+                f"\n[red]✗ 需求里提到了 {guess},但 --subject 没指定,"
+                f"默认是 {subject}[/red]"
+            )
+            console.print("[dim]  你大概想要:[/dim]")
+            console.print(f'    [bold]leet new --subject {guess} "{req}"[/bold]')
+            console.print(
+                f'[dim]  确实要 {subject} 就加 --subject {subject} 再跑一次。'
+                f"(这一步只是防呆,不会改动任何东西)[/dim]\n"
+            )
+            sys.exit(1)
+
     if agent.claude_path(cfg) is None:
         console.print(f"[red]找不到 claude CLI({cfg.claude_bin})[/red]")
         console.print("[dim]可用 LEETSTUDY_CLAUDE_BIN 指定路径[/dim]")
@@ -390,6 +427,34 @@ def new(ctx: click.Context, requirement: tuple, subject: str, count: int,
             sys.exit(1)
 
 
+def _warn_number_collisions(console, problems) -> None:
+    """题号数字部分重复的话,`leet test <数字>` 会变得有歧义。
+
+    `bank.resolve()` 对纯数字查询走 `^(\\d+)` 前缀匹配,所以两道题数字部分
+    相同就会让它返回 None —— 命令**直接失败**,不是选错一道。
+
+    出题模型是自己挑号的(框架不分配),所以这里是唯一能自动出现重复的地方。
+    只提示、不改动题库:两道题本身都是好的,坏的是编号。
+    """
+    by_num: Dict[str, List[str]] = {}
+    for p in problems:
+        m = re.match(r"^(\d+)", p.id)
+        if m:
+            by_num.setdefault(m.group(1), []).append(p.id)
+    for num, ids in sorted(by_num.items()):
+        if len(ids) > 1:
+            console.print(
+                f"\n[yellow]⚠ 题号 {num} 被多道题用了:[/yellow] "
+                + ", ".join(ids)
+            )
+            console.print(
+                f"[dim]  这会让 `leet test {int(num)}` 有歧义并直接失败。"
+                f"题目本身没问题,改一下 id 前缀即可 —— "
+                f"各科目应该用各自的前缀(cuda 纯数字 / py01 / cpp01),"
+                f"不要共用数字序列。[/dim]"
+            )
+
+
 def _author_one(cfg, agent, prompts, req: str, subject: str, repair_rounds: int,
                 no_validate: bool, only_one: bool) -> tuple:
     """出一道题的完整流程:出题 → 独立验证 → 回喂修复。
@@ -426,6 +491,8 @@ def _author_one(cfg, agent, prompts, req: str, subject: str, repair_rounds: int,
 
     console.print(f"\n[green]产出了 {len(created)} 道题:[/green]"
                   + ", ".join(p.id for p in created))
+
+    _warn_number_collisions(console, problems)
 
     if no_validate:
         return [p.id for p in created], [p.id for p in created]
