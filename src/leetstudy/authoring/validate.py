@@ -173,7 +173,14 @@ def _optimal_check(subject, problem: Problem, build_root: Path,
 
     path = problem.root / fname
     if not path.is_file():
-        return (name, True, f"未提供 {fname}(可选;存量题目在陆续补)")
+        # 有评级门槛的题**必须**有参考解 —— 否则「门槛物理可达」这件事没有任何
+        # 依据,一个永远拿不到的门槛也没人拦得住。没有门槛的题则无所谓。
+        if problem.perf.enabled and problem.perf.grades:
+            return (name, False,
+                    f"未提供 {fname} —— 本题设了评级门槛 {problem.perf.grades},"
+                    f"没有参考解就无法证明它真的达得到。"
+                    f"请写一份能达到 S 级的实现放到 {fname}")
+        return (name, True, f"未提供 {fname}(本题未设评级门槛,不影响)")
 
     build = subject.prepare_variant(problem, path, build_root, "chk_optimal")
     if not build.ok:

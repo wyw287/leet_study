@@ -386,9 +386,12 @@ def build_author_prompt(requirement: str, root: Path, subject: str = "cuda",
     schema, requirements, workflow = _blocks(subject)
     example_id = example_id or DEFAULT_EXAMPLE.get(subject, "01-vector-add")
     example_dir = root / "problems" / example_id
-    example_files = ("spec.yaml", "reference.py", "baseline.py", "template.py") \
+    # 范例里必须带上参考解 —— 否则出题者只能从文字描述猜它该长什么样,
+    # 而"照着范例做"比"照着说明做"可靠得多。
+    example_files = ("spec.yaml", "reference.py", "baseline.py", "template.py",
+                     "optimal.py") \
         if subject == "pytorch" else \
-        ("spec.yaml", "reference.cpp", "baseline.cu", "template.cu")
+        ("spec.yaml", "reference.cpp", "baseline.cu", "template.cu", "optimal.cu")
     example_text = ""
     for fname in example_files:
         f = example_dir / fname
