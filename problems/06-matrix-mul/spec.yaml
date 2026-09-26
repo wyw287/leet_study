@@ -1,0 +1,71 @@
+id: 06-matrix-mul
+title: 矩阵乘法(分块 GEMM)
+difficulty: 4
+tags: [gemm, tiling, shared-memory, register-blocking, compute-bound, reuse]
+concepts:
+  - 算术强度:每从内存搬 1 个字节,能喂饱多少次 FMA
+  - 共享内存分块:把每个元素被读 N 次,变成被读 1 次
+  - 寄存器分块(每线程算多个输出):访存指令数决定成败
+  - 越界补 0 换内层循环无分支
+statement: problem.md
+
+# a 和 b 都是 n×n(row-major),out = a @ b,n×n
+buffers:
+  - {name: a,   dtype: f32, shape: [n, n], role: in}
+  - {name: b,   dtype: f32, shape: [n, n], role: in}
+  - {name: out, dtype: f32, shape: [n, n], role: out}
+params:
+  - {name: n, dtype: i32}
+
+entry:
+  kernel: matmul
+  launcher: matmul_launch
+
+cases:
+  # 2048³ = 86 亿次 FMA(= 17.2 GFLOP),三块 16MiB 的矩阵。这是本题的主力用例。
+  # 注意它**不测显存带宽**:48MiB 三块矩阵整个装得进 4090 的 72MB L2,
+  # 基线慢的原因不是「搬不动」,而是「请求次数太多」—— 详见题面。
+  - {name: square, params: {n: 2048}}
+  # 1531 是质数,且不是任何 tile 尺寸的倍数:tile 的边界判断写错就会在这里崩。
+  # 规模与 square 同量级,保证两个用例的加速比在同一个区间(评级取最大值,
+  # 用例之间倍数不一致会让评级失去区分度)。
+  - {name: ragged, params: {n: 1531}}
+  # 比一个 tile 还小(100 < 64×2),用来跑 racecheck。
+  # 规模小到总耗时远低于 20µs 的评级下限,所以它不参与评级 —— 专职考边界。
+  - {name: tiny,   params: {n: 100}}
+
+# 2048 项 f32 累加换来另一种结合顺序,与 double 参考值的偏差实测在 1e-4 量级,
+# 而错误实现(漏 tile、漏边界、只算一半 k)的偏差是 O(1)~O(10) 的,分得很开。
+verify:
+  atol: 1e-3
+  rtol: 1e-4
+  repeat: 3
+
+perf:
+  # 基线不是被 DRAM 带宽卡住的(48MiB 全在 L2 里),是被「每个输出要发 2n 条
+  # 访存指令」卡住的。分块 + 寄存器分块能把它降到 1/8 以下,而 FMA 只有 86 亿次
+  # —— 所以这题有真实的优化空间,用相对基线的加速比评级。
+  bound: compute
+  metric: speedup
+  repeat: 50
+  warmup: 10
+  # 门槛由实测倒推(2026-09-25,4090;四个档次的 square 用例实测,详见题面):
+  #     基线(1 线程 1 输出)              3230 µs   1.00x
+  #     只做共享内存分块(TILE=32,R=1)     2887 µs   1.17x   ← 只快 17%,拿不到 B
+  #     分块 + 2×2 寄存器分块              986 µs   3.41x
+  #     分块 + 4×4 寄存器分块(参考解)      562 µs   5.74x   ← 30.6 TFLOPS
+  #   (2×2 档另测了 TILE=64/1024 线程:1006µs / 3.35x,与 3.41x 基本一致,
+  #    说明这个档次的位置是稳的,不是某一个配置的偶然。)
+  #
+  # 三条门槛都卡在实测数字的**空隙**里:
+  #   B=1.5  —— 高于「只分块」的 1.17,低于 2×2 档的 3.41:必须真的做寄存器分块
+  #   A=4.2  —— 高于 2×2 档的 3.41,低于参考解的 5.74:4×4 量级且调得不错
+  #   S=5.2  —— 参考解 5.74 的 91%;共享内存带宽这条通路的理论上限对应约 420µs
+  #             (=6.9x 封顶),所以 S 不是死门槛,但也确实要贴到墙上
+  # 加速比上限的物理依据:FMA 下限 210µs,而 4×4 分块下共享内存吞吐只够喂到
+  # 约 420µs —— 参考解 562µs 已经用到这条通路的 75%。
+  grades: {B: 1.5, A: 4.2, S: 5.2}
+
+sanitize:
+  memcheck: true
+  racecheck_case: tiny

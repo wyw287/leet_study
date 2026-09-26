@@ -1,0 +1,76 @@
+id: 07-histogram
+title: 直方图统计
+difficulty: 3
+tags: [histogram, atomics, contention, shared-memory, privatization, memory-bound]
+concepts:
+  - 原子操作与「同地址串行化」——冲突才是瓶颈,不是带宽
+  - 共享内存私有化(privatization):把冲突搬到更便宜的硬件上
+  - 并行度要铺满整张卡:私有化解决了冲突,接下来撞的是 SM 闲置
+  - 共享内存的 bank 冲突,以及 __syncthreads 管不了一个 grid
+statement: problem.md
+
+# data 里是 0..99 的整数(randint 填 0..99),要数出每个值出现了多少次。
+# nbins 故意给 128 > 100:100..127 这 28 个桶一个数都不会落进去,
+# 所以「有没有先清零」在这里会留下铁证 —— 忘了清零,那 28 个桶就是毒值。
+buffers:
+  - {name: data, dtype: i32, shape: [n], role: in, fill: randint}
+  - {name: bins, dtype: i32, shape: [nbins], role: out}
+params:
+  - {name: n, dtype: i32}
+  - {name: nbins, dtype: i32}
+
+entry:
+  kernel: histogram
+  launcher: histogram_launch
+
+cases:
+  # 访存型题目的老规矩:被计时的用例要足够大,让 kernel 跑到上百 µs。
+  # 32M 个 int = 128MB 读,参考解实测 0.146 ms —— 远在 20µs 的评级下限之上。
+  - {name: big,    params: {n: 33554432, nbins: 128}}   # 2^25,整除任何 2 的幂块大小
+  - {name: ragged, params: {n: 16777259, nbins: 128}}   # 质数级,且不整除 4 → 向量化要写尾巴
+  - {name: tiny,   params: {n: 262144,   nbins: 128}}   # 25 万,竞态检查用(不参与评级)
+  # 三个用例都是「一个元素读一次、往一个桶加一次」,放大倍数一致,
+  # 不会出现某个用例一家垄断评级的情况。
+
+# bins 是整数,框架对整数输出要求**精确相等**(atol/rtol 不参与整数比较),
+# 所以这里填 0 只是明示:计数没有容差可言,差一个就是错。
+verify:
+  atol: 0.0
+  rtol: 0.0
+  repeat: 3
+
+perf:
+  # 读 128MB、只写 512 字节 —— 这题「本该」是纯粹的访存题。
+  # 但朴素实现根本走不到带宽上:33M 次全局原子加全挤在 100 个地址上,
+  # 而 L2 对**同一个地址**的原子操作是串行的。瓶颈在原子单元,不在显存。
+  #
+  # 所以这题有真实的优化空间 —— 却仍然用 bandwidth 评级而不是 speedup:
+  # 「够不够快」的正确答案是「读到接近峰值带宽」,这是个有物理锚点的量;
+  # 而 speedup 的锚点(基线)是个病态实现,倍数会大到失去刻度感
+  # (实测基线比参考解慢约 40 倍)。题面里两个数都给了。
+  bound: memory
+  metric: bandwidth
+  repeat: 50
+  warmup: 10
+  # 门槛由实测倒推(2026-09-25,4090,框架自动清 L2,big 用例 n=33554432):
+  #     朴素基线(全局原子加,131072 块)    ~6.2 ms     ~22 GB/s    ~2%   不合格
+  #     私有化,但只开 32 块                0.335 ms     401 GB/s    40%   C
+  #     私有化,64 块                       0.188 ms     712 GB/s    71%   A
+  #     私有化,128 块(=每 SM 一块)        0.148 ms     904 GB/s    90%   S
+  #     私有化,4096 块 ← 参考解            0.146 ms     917 GB/s    91%   S
+  #     私有化 + int4,4096 块              0.144 ms     930 GB/s    92%   (与参考解在噪声内)
+  #
+  # 三条门槛都卡在实测数字的**空隙**里:
+  #   B=50 —— 高于「私有化但只开 32 块」的 40%,低于 64 块的 71%:
+  #           光是「想到了私有化」不够,还得让块数铺开
+  #   A=65 —— 低于 64 块的 71%,高于 32 块的 40%:并行度中等
+  #   S=80 —— 参考解 91% 的 88%,128 块(每 SM 一块)也够得着:
+  #           要求把「读」这条通路用上八成,但不要求精调
+  # 上界说明:把冲突搬走之后这题就退化成普通访存题,128 块到 4096 块之间
+  # 只差 1 个百分点,再加 int4 也只有 92% —— 所以 S 不是死门槛,
+  # 但它也确实要求你认出「并行度必须铺满 128 个 SM」这件事。
+  grades: {B: 50, A: 65, S: 80}
+
+sanitize:
+  memcheck: true
+  racecheck_case: tiny
