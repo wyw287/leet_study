@@ -20,6 +20,29 @@
   只有 2 个还赢,且那 2 个各有别的解释)。
 
 所以选项锁死,并且题面里要说明白。
+
+为什么带 `-pthread` / `-fopenmp`
+--------------------------------
+这两个不算"优化开关",是**基础设施**:没有它们,学习者写的多线程代码根本
+跑不起来,而且失败方式很糟 ——
+
+* `std::thread` → **链接失败**:`undefined reference to pthread_create`
+  (本机 glibc 2.31,pthread 还是独立的库)。错误信息里看不出要加什么。
+* `#pragma omp` → **静默忽略**。不加 `-fopenmp` 时 `_OPENMP` 宏是 0,
+  pragma 被当作注释丢掉:不报错、不并行,学习者只会得到"线程没有用"的错误结论。
+  这个比链接失败更难查,必须堵掉。
+
+加上去对单线程代码零影响(实测见 `_CFLAGS` 的注释),所以没有理由不加。
+
+**多线程本身不做限制。** 这是本框架「测到什么就是什么」立场的延续:
+成绩反映的是真实的加速比,不因为"用了什么手段"而加减。代价是用线程有可能
+绕过某道题想教的访存模式 —— 所以出题时应该在题面里**写清楚为什么不建议**
+(见 `problems/cpp02-sum-reduction-chain/problem.md` 的陷阱一节),而不是靠
+框架去禁。
+
+> 一个实际注意点:OpenMP **默认开到全部核心**(本机实测 `omp_get_max_threads()`
+> = 256)。这台机器是共享的、负载常年三位数,256 线程跑出来的数字会非常抖。
+> 题面里如果允许线程,应该提醒用 `omp_set_num_threads(k)` 限制在个位数。
 """
 from __future__ import annotations
 
@@ -38,7 +61,14 @@ from .base import Artifact, BuildResult, CaseResult, SanitizeResult, Subject
 
 #: 编译选项。**改动这里等于改动所有已出题目的难度** —— 见模块 docstring。
 #: 刻意不含 -ffast-math:放开它,编译器就能重排浮点归约,一批结构性题会失去意义。
-_CFLAGS = ("-O3", "-march=native", "-std=c++17")
+#:
+#: `-pthread` / `-fopenmp` 是**基础设施**,不是优化开关 —— 它们让学习者写的
+#: 多线程代码能跑起来,而不是改判定规则。实测(2026-09-26)对单线程代码零影响:
+#:   (无)                 78.62 / 78.38 / 80.26 ms
+#:   + -pthread           78.46 / 79.02 / 78.60 ms
+#:   + -pthread -fopenmp  78.96 / 78.89 / 78.58 ms
+#: 而且 .text 段大小完全一致(10949 字节),所以不需要重定任何题的门槛。
+_CFLAGS = ("-O3", "-march=native", "-std=c++17", "-pthread", "-fopenmp")
 
 
 _MUTANT_DOC = {

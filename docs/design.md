@@ -405,7 +405,8 @@ perf:
 
 ### 8.2 编译选项必须由框架钉死
 
-`subjects/cpp.py` 里写死 `-O3 -march=native -std=c++17`,**刻意不含 `-ffast-math`**。
+`subjects/cpp.py` 里写死 `-O3 -march=native -std=c++17 -pthread -fopenmp`,
+**刻意不含 `-ffast-math`**。
 这不是随手写的:
 
 - 不带 fast-math,编译器**不允许重排浮点运算**,所以「归约用 4 个累加器」

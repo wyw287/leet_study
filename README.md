@@ -340,7 +340,8 @@ $ leet test cpp01       # 还没做任何优化
 
 **没设这个字段的题行为一字未变** —— 性能仍然只评级、不卡关。
 
-编译选项(`-O3 -march=native`,**不带** `-ffast-math`)由框架钉死,改它不算数。
+编译选项(`-O3 -march=native -pthread -fopenmp`,**不带** `-ffast-math`)由框架钉死,
+改它不算数。多线程能跑(`-pthread` / `-fopenmp` 是为这个加的),但框架不限制也不鼓励。
 理由见 [`docs/design.md`](docs/design.md) 第八节:实测同一个 `-ffast-math`
 能让一份没改过的源码白拿 4 倍。
 
