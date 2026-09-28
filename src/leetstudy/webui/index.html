@@ -73,6 +73,9 @@
   button.act:hover{border-color:var(--accent)}
   button.act.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
   button.act:disabled{opacity:.5;cursor:not-allowed}
+  /* 正在跑的那个按钮要看得出来是"它" —— 否则它和旁边几个禁用的按钮
+     长得一样,还因为不是主按钮而更不显眼。 */
+  button.act.running{opacity:1;border-color:var(--accent);color:var(--accent)}
   .status{color:var(--dim);font-size:12px;margin-left:auto}
 
   /* 编辑器 */
@@ -129,9 +132,10 @@
   pre.out{background:var(--code-bg);border:1px solid var(--line);border-radius:9px;
     padding:12px;overflow:auto;max-height:420px;font-size:12.5px;
     white-space:pre-wrap;word-break:break-word;margin:0}
-  .spin{display:inline-block;width:9px;height:9px;border-radius:50%;
-    background:var(--accent);animation:p 1s infinite}
-  @keyframes p{0%,100%{opacity:.25}50%{opacity:1}}
+  .spin{display:inline-block;box-sizing:border-box;width:11px;height:11px;
+    margin-right:7px;border:2px solid currentColor;border-right-color:transparent;
+    border-radius:50%;animation:spin .65s linear infinite;vertical-align:-1px}
+  @keyframes spin{to{transform:rotate(360deg)}}
 
   /* ---- 题面 + 目录 ----
      宽屏时目录吸附在右侧(题面限宽 76ch,右边本来就空着一大片);
@@ -276,6 +280,10 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g,
 let CUR = null;          // 当前题目 id
 let DATA = null;         // 当前题目详情
 let JOB = null;          // 正在轮询的任务
+let JOB_ACTION = "";     // 跑的是哪个动作(test / bench / start)
+let JOB_T0 = 0;          // 提交时刻,用来算用时
+let JOB_PHASE = "";      // queued | running
+let TICK = null;         // 只管刷新"已用多少秒",不影响轮询
 /* 是否有未保存的改动 —— **和盘上的内容比**,不用布尔标志。
    用标志会踩坑:初始化时为了设置显示状态派发过一次合成的 input 事件,
    于是"刚打开一道题"就被标记成改过了,关页面时无端弹提醒。
@@ -436,6 +444,7 @@ function renderCode(){
                <button class="act" id="b-bench">测性能 bench</button>` : ""}
       <span class="status">${has ? esc(DATA.solution_path) : "还没有解答文件"}</span>
       <span class="status" id="dirty" style="display:none;color:var(--warn)">● 未保存</span>
+      <span class="status" id="prog" style="display:none"></span>
     </div>
     ${has ? `<div class="ed">
         <pre class="hl"><code id="edhl"></code></pre>
@@ -581,31 +590,77 @@ async function run(action){
     {method:"POST"}).then(r=>r.json());
   if(r.error) return toast(r.error);
   JOB = r.job.id;
+  JOB_ACTION = action;
+  JOB_T0 = Date.now();
+  JOB_PHASE = "queued";
   const out = $("#jobout");
   if(out){ out.style.display="block"; out.textContent = "已提交,排队中…\n"; }
-  setBusy(true);
+  setBusy(true, action);
+  startTick();
   poll();
 }
 
-function setBusy(b){
+const ACTION_CN = {test:"判题", bench:"测性能", start:"创建工作区", solution:"读参考解"};
+
+function setBusy(busy, action){
   for(const id of ["b-save","b-test","b-bench","b-start"]){
-    const el = document.getElementById(id); if(el) el.disabled = b;
+    const el = document.getElementById(id);
+    if(!el) continue;
+    el.disabled = busy;
+    // 记住原始文字 —— 任务结束后要变回去
+    if(!el.dataset.label) el.dataset.label = el.textContent;
+    const active = busy && action && id === "b-" + action;
+    el.classList.toggle("running", !!active);
+    if(active){
+      el.innerHTML = `<span class="spin"></span>${ACTION_CN[action] || "处理"}中…`;
+    } else {
+      el.textContent = el.dataset.label;
+    }
   }
+}
+
+/* 进度行:"排队中 · 0.4s" / "运行中 · 4.2s"。
+   leet test 要 11~21 秒,光把按钮置灰等于没反馈 —— 至少得让人看见
+   它在动、以及已经等了多久。 */
+function startTick(){
+  clearInterval(TICK);
+  TICK = setInterval(paintProg, 100);
+  paintProg();
+}
+
+function paintProg(){
+  const el = $("#prog");
+  if(!el) return;
+  if(!JOB){ el.style.display = "none"; return; }
+  const s = ((Date.now() - JOB_T0) / 1000).toFixed(1);
+  el.style.display = "";
+  el.style.color = "var(--dim)";
+  el.innerHTML = (JOB_PHASE === "queued" ? "排队中" : "运行中")
+    + ` <span style="opacity:.6">·</span> ${s}s`;
+}
+
+function stopTick(){
+  clearInterval(TICK); TICK = null;
+  const el = $("#prog"); if(el) el.style.display = "none";
 }
 
 async function poll(){
   if(!JOB) return;
   const r = await fetch("/api/jobs/"+JOB).then(r=>r.json());
-  if(r.error){ JOB=null; setBusy(false); return toast(r.error); }
+  if(r.error){ JOB=null; stopTick(); setBusy(false); return toast(r.error); }
   const out = $("#jobout");
   if(out) out.textContent = r.output || "(没有输出)";
   if(out) out.scrollTop = out.scrollHeight;
-  if(r.status === "running" || r.status === "queued"){ setTimeout(poll, 700); return; }
-  JOB = null; setBusy(false);
+  if(r.status === "running" || r.status === "queued"){
+    JOB_PHASE = r.status;
+    setTimeout(poll, 700); return;
+  }
+  const secs = ((Date.now() - JOB_T0) / 1000).toFixed(1);
+  JOB = null; stopTick(); setBusy(false);
   if(r.status === "failed"){
-    toast("任务失败(退出码 " + r.returncode + ")");
+    toast(`失败(退出码 ${r.returncode}) · 用时 ${secs}s`);
   } else {
-    toast("完成");
+    toast(`完成 · 用时 ${secs}s`);
     // 重新拉题目详情:解答可能刚由 start 生成,判题结果也刷新了
     DATA = await fetch("/api/problems/"+encodeURIComponent(CUR)).then(r=>r.json());
     renderResult(DATA.verdict);
