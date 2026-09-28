@@ -18,3 +18,8 @@ leet = "leetstudy.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# 前端是单个 HTML 文件,跟 webui 子包一起打包 —— 不声明的话
+# 装出来的 wheel 里没有它,`leet web` 会报找不到页面。
+[tool.setuptools.package-data]
+"leetstudy.webui" = ["index.html"]

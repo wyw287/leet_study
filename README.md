@@ -74,6 +74,7 @@ $EDITOR solutions/01-vector-add/solution.cu
 | **出一道具(或改题)** | [`docs/authoring.md`](docs/authoring.md) |
 | **理解为什么这样设计** | [`docs/design.md`](docs/design.md) |
 | **遇到报错 / 装不上** | [`docs/troubleshooting.md`](docs/troubleshooting.md) |
+| **在浏览器里刷题** | [`docs/webui.md`](docs/webui.md) |
 | **让 AI 助手接着改这个项目** | [`CLAUDE.md`](CLAUDE.md) |
 | **改配置** | [`config.yaml.example`](config.yaml.example) |
 
@@ -95,6 +96,7 @@ $EDITOR solutions/01-vector-add/solution.cu
 | `leet new "<需求>" [--subject cuda\|pytorch\|cpp] [--count N]` | 让本地 claude 自动出题(含自验证与修复回路) |
 | `leet validate [--all\|<题号>]` | 题库健康检查 |
 | `leet stats` | 学习进度看板 |
+| `leet web [--port N] [--open]` | **在浏览器里刷题** —— 题库侧栏、在线编辑、判题结果表格 |
 | `leet clean` | 清理编译产物 |
 
 ### 题号可以省略

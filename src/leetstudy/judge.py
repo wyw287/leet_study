@@ -166,7 +166,7 @@ def _case_to_dict(cv: CaseVerdict) -> Dict[str, Any]:
     全部重算(见 `load_verdict`),**不依赖**这里存的值 —— 所以不存在"两处算法
     漂移"的问题。
 
-    存它们是为了**终端之外的消费者**(`webui/`):那些消费者拿不到 `score_verdict`,
+    存它们是为了**终端之外的消费者**(`leet web`,即 `leetstudy/webui/`):那些消费者拿不到 `score_verdict`,
     不存就只能自己把评分逻辑抄一遍,那才真的会产生漂移。缓存里这份是每次
     `leet test` 刚算出来的,与判题结果同源。
     """

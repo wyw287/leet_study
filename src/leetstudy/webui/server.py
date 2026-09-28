@@ -33,8 +33,17 @@ RCE by design。所以默认只绑 127.0.0.1,不要暴露到网络。
 
 用法
 ----
-    python3 webui/server.py            # 默认 http://127.0.0.1:8765
-    python3 webui/server.py --port 9000
+作为框架的子命令(常用):
+
+    leet web                    # http://127.0.0.1:8765
+    leet web --port 9000 --open
+
+也可以单独跑(调试本模块时方便,不需要装 leet 命令):
+
+    python3 src/leetstudy/webui/server.py
+
+**这个模块不 import 框架的其它部分** —— 只读文件 + 调 `leet` CLI。
+仓库根与 `leet` 可执行文件的位置都由调用方传进来(见 `serve`)。
 """
 from __future__ import annotations
 
@@ -43,6 +52,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -56,16 +66,60 @@ from typing import Any, Dict, List, Optional
 try:
     import yaml
 except ImportError:  # pragma: no cover
-    sys.exit("缺 PyYAML。用项目的 venv 跑:`.venv/bin/python webui/server.py`")
+    sys.exit("缺 PyYAML。用项目的 venv 跑:`.venv/bin/python -m leetstudy.webui.server`")
 
-HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent                      # 仓库根(problems/ solutions/ 都在这)
-LEET = ROOT / ".venv" / "bin" / "leet"  # CLI 入口
+HERE = Path(__file__).resolve().parent          # 本模块所在目录(模板也在这)
 
-PROBLEMS_DIR = ROOT / "problems"
-SOLUTIONS_DIR = ROOT / "solutions"
-BUILD_DIR = ROOT / "build"
-PROGRESS = ROOT / "progress.json"
+# ---------------------------------------------------------------------------
+# 运行位置(仓库根 / leet 可执行文件)
+#
+# 由 `serve()` 在启动时设一次,之后只读。放模块级而不是层层传参,是因为
+# **一个进程只有一个 server**,而且这些值在第一个请求到达之前就定下来了 ——
+# 为它把参数穿透十几层调用不划算。`_require_root()` 保证没人能读到 None。
+# ---------------------------------------------------------------------------
+ROOT: Optional[Path] = None
+LEET: Optional[Path] = None
+PROBLEMS_DIR: Optional[Path] = None
+SOLUTIONS_DIR: Optional[Path] = None
+BUILD_DIR: Optional[Path] = None
+PROGRESS: Optional[Path] = None
+
+
+def _require_root() -> Path:
+    if ROOT is None:
+        raise RuntimeError("webui 还没初始化:请通过 `leet web` 或 serve() 启动")
+    return ROOT
+
+
+def _bind_root(root: Path, leet_bin: Path) -> None:
+    global ROOT, LEET, PROBLEMS_DIR, SOLUTIONS_DIR, BUILD_DIR, PROGRESS
+    ROOT = Path(root).resolve()
+    LEET = Path(leet_bin).resolve()
+    PROBLEMS_DIR = ROOT / "problems"
+    SOLUTIONS_DIR = ROOT / "solutions"
+    BUILD_DIR = ROOT / "build"
+    PROGRESS = ROOT / "progress.json"
+
+
+def find_root(start: Optional[Path] = None) -> Optional[Path]:
+    """从 start 往上找带 `problems/` 的目录。供独立运行时兜底(不走框架)。"""
+    d = (start or Path.cwd()).resolve()
+    for cand in [d, *d.parents]:
+        if (cand / "problems").is_dir():
+            return cand
+    return None
+
+
+def find_leet(root: Path) -> Optional[Path]:
+    """找 `leet` 可执行文件:先 PATH,再项目 venv。供独立运行时兜底。"""
+    found = shutil.which("leet")
+    if found:
+        return Path(found)
+    for cand in (root / ".venv" / "bin" / "leet", root / ".venv/bin/leet.exe"):
+        if cand.is_file():
+            return cand
+    return None
+
 
 #: 单个任务保留的输出上限(防止 `leet new` 那种长任务把内存吃光)
 MAX_OUTPUT_CHARS = 400_000
@@ -340,9 +394,13 @@ class Handler(BaseHTTPRequestHandler):
             opt = PROBLEMS_DIR / pid / _optimal_name(pid)
             opt_src = opt.read_text(encoding="utf-8") if opt.is_file() else ""
             sol_src = sol.read_text(encoding="utf-8") if sol else ""
+            stmt_src = stmt.read_text(encoding="utf-8") if stmt.is_file() else ""
             return self._send_json({
                 "id": pid, "spec": spec,
-                "statement": stmt.read_text(encoding="utf-8") if stmt.is_file() else "",
+                "statement": stmt_src,
+                # 题面的 HTML(服务端用 markdown-it-py 渲染,代码块交给 Pygments)。
+                # 拿不到 markdown-it-py 时是 null,前端退回纯文本渲染。
+                "statement_html": _render_markdown(stmt_src),
                 "solution_path": str(sol.relative_to(ROOT)) if sol else None,
                 "solution": sol_src,
                 "optimal": opt_src,
@@ -493,8 +551,111 @@ def _highlight_css() -> str:
     return f"{light}\n@media (prefers-color-scheme: dark) {{\n{dark}\n}}"
 
 
-def main() -> None:
+# --------------------------------------------------------------------------- #
+# 题面渲染
+#
+# 用 **markdown-it-py** —— 和 Pygments 一样,它**已经在 venv 里**
+# (`rich` 的依赖),所以零新增依赖、不碰 CDN。选它而不是继续用前端那版手写的
+# 正则渲染器,理由:
+#
+# * 手写版只覆盖了「题面看起来会用到」的子集,边界情况(列表嵌套、表格对齐、
+#   转义)全靠猜。CommonMark 的规则比看上去多得多。
+# * 它能把围栏代码块**交给 Pygments**,于是题面里的 ```cuda / ```python
+#   和编辑器、参考解页共用同一套配色,不会两处不一样。
+#
+# ⚠️ 声明式地说明这里的一个前提:**题面里不能有原始 HTML**。preset 用
+#   `commonmark` 且不开 `html` 选项,所以 `<div>` 之类会被转义成文本 ——
+#   这对本项目的题库是对的(题面由出题规范约束,不该嵌 HTML)。
+# --------------------------------------------------------------------------- #
+
+#: MarkdownIt 实例。**模块级建一次** —— 它是有状态的解析器,每次重建很浪费。
+#: 建失败(没装 markdown-it-py)时留 None,调用方退回纯文本。
+_MD = None
+_MD_FAILED = False
+
+
+def _md_instance():
+    global _MD, _MD_FAILED
+    if _MD is None and not _MD_FAILED:
+        try:
+            from markdown_it import MarkdownIt
+            _MD = (MarkdownIt("commonmark", {"highlight": _md_highlight})
+                   .enable("table").enable("strikethrough"))
+        except ImportError:
+            _MD_FAILED = True
+    return _MD
+
+
+def _md_highlight(code: str, lang: str, attrs: str = "") -> str:
+    """给围栏代码块上色。**返回空串 = 不进高亮**,交给 markdown-it 自己转义。
+
+    没标语言的围栏(题面里有 90 多处,多是公式和输出样例)走的正是这条路 ——
+    它们不需要语法着色,但仍然是一个等宽代码块。
+    """
+    lang = (lang or "").strip().split()[0] if lang else ""
+    if not lang:
+        return ""
+    try:
+        from pygments import highlight
+        from pygments.formatters import HtmlFormatter
+        from pygments.lexers import get_lexer_by_name
+        return highlight(code, get_lexer_by_name(lang), HtmlFormatter(nowrap=True))
+    except Exception:                                   # noqa: BLE001
+        return ""                                       # 语言不认识 -> 普通代码块
+
+
+def _render_markdown(text: str) -> Optional[str]:
+    """题面 -> HTML。拿不到 markdown-it-py 时返回 None(前端退回纯文本)。"""
+    md = _md_instance()
+    if md is None or not text:
+        return None
+    try:
+        html = md.render(text)
+    except Exception:                                   # noqa: BLE001
+        return None
+    # 代码块复用编辑器那套 Pygments 配色(样式规则是按 .hl 定义的);
+    # markdown-it 输出的就是裸 <pre><code>,这里加个类名即可。
+    return html.replace("<pre>", '<pre class="hl">')
+
+
+def serve(root: Path, leet_bin: Path, host: str = "127.0.0.1", port: int = 8765,
+          open_browser: bool = False) -> None:
+    """起服务,阻塞直到 Ctrl-C。
+
+    仓库根与 `leet` 可执行文件由调用方给(`leet web` 从框架拿,独立运行时自己找)——
+    这样本模块不必知道框架怎么定位仓库。
+    """
     global JOBS
+    _bind_root(root, leet_bin)
+
+    if not PROBLEMS_DIR.is_dir():
+        sys.exit(f"找不到题库目录 {PROBLEMS_DIR}")
+    if not LEET.is_file():
+        sys.exit(f"找不到 {LEET}\n先建好 venv:python3 -m venv .venv && .venv/bin/pip install -e .")
+
+    JOBS = JobQueue(ROOT)
+    url = f"http://{host}:{port}/"
+    print(f"leet web  →  {url}")
+    print(f"  仓库:{ROOT}")
+    print(f"  CLI :{LEET}")
+    print("  Ctrl-C 退出")
+    if open_browser:
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+
+    srv = ThreadingHTTPServer((host, port), Handler)
+    srv.daemon_threads = True
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n再见")
+
+
+def main() -> None:
+    """独立运行时的入口(不走框架)。
+
+    直接 `python3 src/leetstudy/webui/server.py` 时,仓库根和 leet 都得自己找 ——
+    平时不用这条路,调试本模块时方便。
+    """
     ap = argparse.ArgumentParser(description="leet_study 的本地 web 界面")
     ap.add_argument("--host", default="127.0.0.1",
                     help="绑定地址。默认只绑本机 —— 这个工具会执行任意解答代码")
@@ -502,26 +663,15 @@ def main() -> None:
     ap.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
     args = ap.parse_args()
 
-    if not LEET.is_file():
-        sys.exit(f"找不到 {LEET}\n先建好 venv:python3 -m venv .venv && .venv/bin/pip install -e .")
-    if not PROBLEMS_DIR.is_dir():
-        sys.exit(f"找不到题库目录 {PROBLEMS_DIR}")
-
-    JOBS = JobQueue(ROOT)
-    url = f"http://{args.host}:{args.port}/"
-    print(f"leet web  →  {url}")
-    print(f"  仓库:{ROOT}")
-    print(f"  CLI :{LEET}")
-    print("  Ctrl-C 退出")
-    if args.open:
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    srv.daemon_threads = True
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print("\n再见")
+    root = find_root()
+    if root is None:
+        sys.exit("找不到仓库根(往上找不到 problems/ 目录)。"
+                 "用 `leet web` 启动,或在一个题目仓库里运行。")
+    leet = find_leet(root)
+    if leet is None:
+        sys.exit(f"在 PATH 和 {root/'.venv/bin/leet'} 里都没找到 `leet`。"
+                 "先装好:python3 -m venv .venv && .venv/bin/pip install -e .")
+    serve(root, leet, host=args.host, port=args.port, open_browser=args.open)
 
 
 if __name__ == "__main__":
