@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>leet web</title>
+<!-- Pygments 的 token 配色,服务端按扩展名选 lexer(见 server.py 的 _highlight) -->
+<link rel="stylesheet" href="/api/highlight.css">
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#fff; --fg:#1c1f23; --dim:#6b7280; --line:#e3e6ea;
+    --accent:#2563eb; --ok:#15803d; --bad:#b91c1c; --warn:#b45309;
+    --code-bg:#f0f2f5; --shadow:0 1px 3px rgba(0,0,0,.06);
+    --s:#7c3aed; --a:#2563eb; --b:#0891b2; --c:#6b7280;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#15171a; --panel:#1d2024; --fg:#e6e8ea; --dim:#9aa1a9; --line:#2c3137;
+      --accent:#60a5fa; --ok:#4ade80; --bad:#f87171; --warn:#fbbf24;
+      --code-bg:#141618; --shadow:0 1px 3px rgba(0,0,0,.4);
+      --s:#c4b5fd; --a:#93c5fd; --b:#67e8f9; --c:#9aa1a9;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",
+    "Hiragino Sans GB","Microsoft YaHei",sans-serif}
+  a{color:var(--accent)}
+  code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,
+    "Liberation Mono",monospace}
+
+  /* 布局 */
+  .wrap{display:grid;grid-template-columns:280px 1fr;height:100vh}
+  aside{background:var(--panel);border-right:1px solid var(--line);
+    overflow-y:auto;padding:14px 10px}
+  main{overflow-y:auto;padding:0}
+  @media(max-width:820px){.wrap{grid-template-columns:1fr}
+    aside{display:none}}
+
+  /* 侧栏 */
+  .brand{font-weight:700;font-size:15px;padding:4px 8px 12px;
+    display:flex;align-items:center;gap:8px}
+  .brand small{font-weight:400;color:var(--dim);font-size:12px}
+  .grp{color:var(--dim);font-size:11px;text-transform:uppercase;
+    letter-spacing:.06em;padding:12px 8px 4px}
+  .item{display:block;width:100%;text-align:left;border:0;background:none;
+    color:inherit;font:inherit;padding:7px 8px;border-radius:7px;cursor:pointer}
+  .item:hover{background:var(--code-bg)}
+  .item.on{background:var(--accent);color:#fff}
+  .item.on .sub,.item.on .id{color:rgba(255,255,255,.8)}
+  .item .id{font-size:11px;color:var(--dim);display:block}
+  .item .sub{font-size:12px;color:var(--dim)}
+  .item .row{display:flex;justify-content:space-between;gap:6px;align-items:baseline}
+
+  /* 主区 */
+  header{padding:16px 22px;border-bottom:1px solid var(--line);
+    background:var(--panel);position:sticky;top:0;z-index:5}
+  header h1{margin:0 0 4px;font-size:18px}
+  .meta{color:var(--dim);font-size:12px;display:flex;gap:10px;flex-wrap:wrap}
+  .pill{background:var(--code-bg);padding:1px 7px;border-radius:99px}
+  .tabs{display:flex;gap:2px;padding:10px 22px 0;border-bottom:1px solid var(--line);
+    background:var(--panel);position:sticky;top:73px;z-index:4}
+  .tab{border:0;background:none;color:var(--dim);font:inherit;padding:7px 13px;
+    cursor:pointer;border-bottom:2px solid transparent}
+  .tab.on{color:var(--fg);border-bottom-color:var(--accent);font-weight:600}
+  .pane{padding:20px 22px 60px;display:none}
+  .pane.on{display:block}
+
+  /* 按钮 */
+  .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  button.act{font:inherit;padding:6px 14px;border-radius:7px;cursor:pointer;
+    border:1px solid var(--line);background:var(--panel);color:var(--fg)}
+  button.act:hover{border-color:var(--accent)}
+  button.act.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  button.act:disabled{opacity:.5;cursor:not-allowed}
+  .status{color:var(--dim);font-size:12px;margin-left:auto}
+
+  /* 编辑器 */
+  textarea{width:100%;min-height:440px;padding:12px;border-radius:9px;
+    border:1px solid var(--line);background:var(--code-bg);color:var(--fg);
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:13px;line-height:1.55;resize:vertical;tab-size:4}
+
+  /* ---- 只读高亮(参考解)---- */
+  pre.hl{margin:0;padding:12px;border:1px solid var(--line);border-radius:9px;
+    background:var(--code-bg);overflow:auto;max-height:560px;font-size:12.5px;
+    line-height:1.55;white-space:pre;tab-size:4}
+
+  /* ---- 编辑器叠加 ----
+     一个透明的 textarea 骑在一份高亮后的 <pre> 上。这样既能编辑又有实时高亮,
+     而且高亮规则和「参考解」页是同一套(都来自服务端的 Pygments)。
+     唯一的坑:两层的 font / line-height / padding / tab-size / white-space
+     必须**逐项一致**,差一点光标就会和文字错位。改动这里时别只改一层。 */
+  .ed{position:relative;border:1px solid var(--line);border-radius:9px;
+    overflow:hidden;background:var(--code-bg);height:470px}
+  .ed pre,.ed textarea{margin:0;border:0;padding:12px;box-sizing:border-box;
+    width:100%;height:100%;
+    font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    tab-size:4;white-space:pre;letter-spacing:normal;word-spacing:normal}
+  .ed pre{overflow:hidden;background:transparent;pointer-events:none}
+  .ed pre code{font:inherit}
+  .ed textarea{position:absolute;inset:0;background:transparent;color:transparent;
+    caret-color:var(--fg);resize:none;outline:none;overflow:auto}
+
+  /* 输出 */
+  pre.out{background:var(--code-bg);border:1px solid var(--line);border-radius:9px;
+    padding:12px;overflow:auto;max-height:420px;font-size:12.5px;
+    white-space:pre-wrap;word-break:break-word;margin:0}
+  .spin{display:inline-block;width:9px;height:9px;border-radius:50%;
+    background:var(--accent);animation:p 1s infinite}
+  @keyframes p{0%,100%{opacity:.25}50%{opacity:1}}
+
+  /* 题面渲染 */
+  .md{max-width:860px}
+  .md h1{font-size:22px;margin:0 0 14px}
+  .md h2{font-size:17px;margin:26px 0 10px;padding-bottom:5px;
+    border-bottom:1px solid var(--line)}
+  .md h3{font-size:15px;margin:18px 0 8px}
+  .md p{margin:9px 0}
+  .md ul,.md ol{margin:9px 0;padding-left:24px}
+  .md li{margin:3px 0}
+  .md code{background:var(--code-bg);padding:1.5px 5px;border-radius:4px;font-size:.9em}
+  .md pre{background:var(--code-bg);padding:12px;border-radius:9px;overflow:auto}
+  .md pre code{background:none;padding:0}
+  .md blockquote{margin:10px 0;padding:2px 14px;border-left:3px solid var(--line);
+    color:var(--dim)}
+  .md table{border-collapse:collapse;margin:12px 0;font-size:13px;display:block;
+    overflow-x:auto}
+  .md th,.md td{border:1px solid var(--line);padding:6px 11px;text-align:left}
+  .md th{background:var(--code-bg);font-weight:600}
+
+  /* 判题结果 */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px;margin-bottom:14px;box-shadow:var(--shadow)}
+  .verdict{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .big{font-size:17px;font-weight:700}
+  .grade{font-size:26px;font-weight:800;line-height:1}
+  .g-S{color:var(--s)}.g-A{color:var(--a)}.g-B{color:var(--b)}.g-C{color:var(--c)}
+  table.cases{width:100%;border-collapse:collapse;font-size:13px}
+  table.cases th,table.cases td{border-bottom:1px solid var(--line);
+    padding:7px 9px;text-align:left;vertical-align:top}
+  table.cases th{color:var(--dim);font-weight:500;font-size:12px}
+  .hint{background:var(--code-bg);border-radius:8px;padding:9px 12px;margin:6px 0;
+    font-size:13px;white-space:pre-wrap}
+  details summary{cursor:pointer;color:var(--dim);font-size:12.5px}
+  .empty{color:var(--dim);padding:30px 0;text-align:center}
+  .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);
+    background:var(--fg);color:var(--bg);padding:9px 18px;border-radius:9px;
+    font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:99}
+  .toast.on{opacity:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <aside>
+    <div class="brand">leet web <small id="qn"></small></div>
+    <div id="list"></div>
+  </aside>
+  <main>
+    <header id="hd"><h1>选一道题</h1>
+      <div class="meta">左边点一下开始</div></header>
+    <div class="tabs" id="tabs" style="display:none">
+      <button class="tab on" data-p="stmt">题面</button>
+      <button class="tab" data-p="code">解答</button>
+      <button class="tab" data-p="result">判题结果</button>
+      <button class="tab" data-p="opt">参考解</button>
+    </div>
+    <div class="pane on" id="p-stmt"><div class="md empty">…</div></div>
+    <div class="pane" id="p-code"></div>
+    <div class="pane" id="p-result"><div class="empty">还没有判题结果</div></div>
+    <div class="pane" id="p-opt"><div class="empty">—</div></div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+let CUR = null;          // 当前题目 id
+let DATA = null;         // 当前题目详情
+let JOB = null;          // 正在轮询的任务
+let DIRTY = false;       // 编辑器有未保存改动
+
+function toast(msg){
+  const t = $("#toast"); t.textContent = msg; t.classList.add("on");
+  clearTimeout(t._h); t._h = setTimeout(()=>t.classList.remove("on"), 1800);
+}
+
+/* ---------- 极简 markdown(只覆盖题面用到的子集,不引 CDN)---------- */
+function md(src){
+  const lines = String(src ?? "").split("\n");
+  let out = [], i = 0, inCode = false, buf = [];
+
+  const inline = s => esc(s)
+    .replace(/`([^`]+)`/g, (_,c)=>`<code>${c}</code>`)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+
+  const flushPara = ()=>{ if(buf.length){ out.push("<p>"+buf.join(" ")+"</p>"); buf=[]; } };
+
+  while(i < lines.length){
+    const ln = lines[i];
+
+    if(/^\s*```/.test(ln)){                       // 代码块
+      flushPara();
+      if(!inCode){ inCode = true; out.push("<pre><code>"); }
+      else { inCode = false; out.push("</code></pre>"); }
+      i++; continue;
+    }
+    if(inCode){ out.push(esc(ln)); i++; continue; }
+
+    if(/^\s*$/.test(ln)){ flushPara(); i++; continue; }
+
+    let m;
+    if((m = ln.match(/^(#{1,6})\s+(.*)$/))){      // 标题
+      flushPara(); const n = m[1].length;
+      out.push(`<h${n}>${inline(m[2])}</h${n}>`); i++; continue;
+    }
+    if(/^\s*>\s?/.test(ln)){                       // 引用
+      flushPara(); const q = [];
+      while(i<lines.length && /^\s*>\s?/.test(lines[i])){
+        q.push(inline(lines[i].replace(/^\s*>\s?/,""))); i++; }
+      out.push("<blockquote>"+q.join("<br>")+"</blockquote>"); continue;
+    }
+    if(/^\s*\|.*\|\s*$/.test(ln)){                 // 表格
+      flushPara(); const rows = [];
+      while(i<lines.length && /^\s*\|.*\|\s*$/.test(lines[i])){
+        rows.push(lines[i].trim().replace(/^\||\|$/g,"").split("|").map(c=>c.trim())); i++; }
+      const body = rows.filter(r=>!r.every(c=>/^:?-{2,}:?$/.test(c)));
+      if(body.length){
+        const head = body[0], rest = body.slice(1);
+        out.push("<table><thead><tr>"+head.map(c=>`<th>${inline(c)}</th>`).join("")+
+          "</tr></thead><tbody>"+rest.map(r=>"<tr>"+r.map(c=>`<td>${inline(c)}</td>`)
+          .join("")+"</tr>").join("")+"</tbody></table>");
+      }
+      continue;
+    }
+    if((m = ln.match(/^\s*[-*]\s+(.*)$/))){        // 无序列表
+      flushPara(); const it = [];
+      while(i<lines.length && (m = lines[i].match(/^\s*[-*]\s+(.*)$/))){
+        it.push(`<li>${inline(m[1])}</li>`); i++; }
+      out.push("<ul>"+it.join("")+"</ul>"); continue;
+    }
+    if((m = ln.match(/^\s*\d+\.\s+(.*)$/))){       // 有序列表
+      flushPara(); const it = [];
+      while(i<lines.length && (m = lines[i].match(/^\s*\d+\.\s+(.*)$/))){
+        it.push(`<li>${inline(m[1])}</li>`); i++; }
+      out.push("<ol>"+it.join("")+"</ol>"); continue;
+    }
+    buf.push(inline(ln)); i++;
+  }
+  if(inCode) out.push("</code></pre>");
+  flushPara();
+  return out.join("\n");
+}
+
+/* ---------- 侧栏 ---------- */
+async function loadList(){
+  const r = await fetch("/api/problems").then(r=>r.json());
+  const ps = r.problems || [];
+  $("#qn").textContent = ps.filter(p=>p.solved).length + "/" + ps.length;
+
+  const groups = {};
+  for(const p of ps) (groups[p.subject] ||= []).push(p);
+  const NAME = {cuda:"CUDA", pytorch:"PyTorch", cpp:"C++ 优化题"};
+  let html = "";
+  for(const [sub, arr] of Object.entries(groups)){
+    html += `<div class="grp">${esc(NAME[sub] || sub)}</div>`;
+    for(const p of arr){
+      const dot = p.solved ? "✓" : (p.started ? "•" : "");
+      html += `<button class="item${p.id===CUR?" on":""}" data-id="${esc(p.id)}">
+        <span class="row"><span class="sub">${esc(p.title)}</span>
+          <span class="id">${dot}${p.best_grade?" "+esc(p.best_grade):""}</span></span>
+        <span class="id">${esc(p.id)}</span></button>`;
+    }
+  }
+  $("#list").innerHTML = html;
+  for(const b of document.querySelectorAll(".item"))
+    b.onclick = ()=> open(b.dataset.id);
+  return ps;
+}
+
+/* ---------- 打开一道题 ---------- */
+async function open(id){
+  if(DIRTY && !confirm("解答还没保存,切走会丢失。继续?")) return;
+  DIRTY = false;
+  CUR = id;
+  DATA = await fetch("/api/problems/"+encodeURIComponent(id)).then(r=>r.json());
+  for(const b of document.querySelectorAll(".item"))
+    b.classList.toggle("on", b.dataset.id === id);
+
+  const s = DATA.spec || {};
+  $("#hd").innerHTML = `<h1>${esc(s.title || id)}</h1>
+    <div class="meta">
+      <span class="pill">${esc(s.subject || "")}</span>
+      ${s.difficulty?`<span class="pill">难度 ${esc(s.difficulty)}</span>`:""}
+      ${(s.tags||[]).map(t=>`<span class="pill">${esc(t)}</span>`).join("")}
+      <span>${esc(id)}</span></div>`;
+  $("#tabs").style.display = "flex";
+
+  $("#p-stmt").innerHTML = `<div class="md">${md(DATA.statement)}</div>`;
+  // 参考解优先用服务端高亮好的 HTML(Pygments 已经把源码转义过了);
+  // 拿不到就退回纯文本 —— 不影响功能。
+  $("#p-opt").innerHTML = DATA.optimal
+    ? (DATA.optimal_html != null
+        ? `<pre class="hl"><code>${DATA.optimal_html}</code></pre>`
+        : `<pre class="out">${esc(DATA.optimal)}</pre>`)
+    : `<div class="empty">这道题没有参考解文件</div>`;
+  renderResult(DATA.verdict);
+  renderCode();
+  // 支持 #code / #result / #opt 深链(刷新后停在原来那一页)
+  const want = (location.hash || "").replace("#","");
+  tab(["stmt","code","result","opt"].includes(want) ? want : "stmt");
+  if(want) history.replaceState(null, "", "#" + want);
+}
+
+/* ---------- 解答 ---------- */
+function renderCode(){
+  const has = !!DATA.solution_path;
+  $("#p-code").innerHTML = `
+    <div class="bar">
+      ${has ? "" : `<button class="act primary" id="b-start">开始做题(生成解答文件)</button>`}
+      ${has ? `<button class="act primary" id="b-save">保存</button>
+               <button class="act" id="b-test">判题 test</button>
+               <button class="act" id="b-bench">测性能 bench</button>` : ""}
+      <span class="status">${has ? esc(DATA.solution_path) : "还没有解答文件"}</span>
+    </div>
+    ${has ? `<div class="ed">
+        <pre class="hl"><code id="edhl"></code></pre>
+        <textarea id="ed" spellcheck="false" autocomplete="off"
+                  autocapitalize="off" autocorrect="off"></textarea>
+      </div>` : ""}
+    <pre class="out" id="jobout" style="display:none;margin-top:12px"></pre>`;
+
+  const st = $("#b-start");
+  if(st) st.onclick = ()=> run("start");
+  const sv = $("#b-save");
+  if(sv) sv.onclick = save;
+  const tt = $("#b-test");
+  if(tt) tt.onclick = ()=> run("test");
+  const bb = $("#b-bench");
+  if(bb) bb.onclick = ()=> run("bench");
+
+  const ed = $("#ed");
+  if(ed){
+    ed.value = DATA.solution;
+    ed.oninput = ()=>{ DIRTY = true; scheduleHighlight(); };
+    ed.onscroll = syncScroll;
+    // 粘贴/撤销不触发 oninput 的场合,补一次
+    ed.addEventListener("paste", ()=> setTimeout(()=>{ DIRTY=true; scheduleHighlight(); }, 0));
+    highlightNow();
+  }
+}
+
+/* ---- 实时高亮:防抖 + 过期响应丢弃 ----
+   走服务端(Pygments)而不是在前端塞一个高亮库,是为了和「参考解」页共用
+   同一套着色规则。实测单次 1~4ms,本地往返完全撑得住打字。 */
+let hlTimer = null, hlSeq = 0;
+
+function scheduleHighlight(){
+  clearTimeout(hlTimer);
+  hlTimer = setTimeout(highlightNow, 180);
+}
+
+async function highlightNow(){
+  const ed = $("#ed"), box = $("#edhl");
+  if(!ed || !box) return;
+  const seq = ++hlSeq;
+  const src = ed.value;
+
+  if(!DATA.solution_lang){                 // 语言认不出来,退回纯文本
+    box.innerHTML = esc(src); syncScroll(); return;
+  }
+  let html = null;
+  try{
+    const r = await fetch("/api/highlight", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({source: src, lang: DATA.solution_lang})});
+    html = (await r.json()).html;
+  }catch(_){ /* 网断了就保持上一次的高亮,别把编辑区搞空 */ }
+
+  if(seq !== hlSeq) return;                // 有更新的请求在路上,丢弃这次的
+  box.innerHTML = (html != null) ? html : esc(src);
+  syncScroll();
+}
+
+function syncScroll(){
+  const ed = $("#ed"), box = $("#edhl");
+  if(ed && box){ box.scrollTop = ed.scrollTop; box.scrollLeft = ed.scrollLeft; }
+}
+
+async function save(){
+  const src = $("#ed").value;
+  const r = await fetch(`/api/problems/${encodeURIComponent(CUR)}/solution`,
+    {method:"PUT", headers:{"Content-Type":"application/json"},
+     body: JSON.stringify({source: src})}).then(r=>r.json());
+  if(r.error) return toast(r.error);
+  DIRTY = false; toast("已保存");
+}
+
+/* ---------- 跑任务 ---------- */
+async function run(action){
+  if(DIRTY && (action==="test"||action==="bench")){
+    await save();
+  }
+  const r = await fetch(`/api/problems/${encodeURIComponent(CUR)}/${action}`,
+    {method:"POST"}).then(r=>r.json());
+  if(r.error) return toast(r.error);
+  JOB = r.job.id;
+  const out = $("#jobout");
+  if(out){ out.style.display="block"; out.textContent = "已提交,排队中…\n"; }
+  setBusy(true);
+  poll();
+}
+
+function setBusy(b){
+  for(const id of ["b-save","b-test","b-bench","b-start"]){
+    const el = document.getElementById(id); if(el) el.disabled = b;
+  }
+}
+
+async function poll(){
+  if(!JOB) return;
+  const r = await fetch("/api/jobs/"+JOB).then(r=>r.json());
+  if(r.error){ JOB=null; setBusy(false); return toast(r.error); }
+  const out = $("#jobout");
+  if(out) out.textContent = r.output || "(没有输出)";
+  if(out) out.scrollTop = out.scrollHeight;
+  if(r.status === "running" || r.status === "queued"){ setTimeout(poll, 700); return; }
+  JOB = null; setBusy(false);
+  if(r.status === "failed"){
+    toast("任务失败(退出码 " + r.returncode + ")");
+  } else {
+    toast("完成");
+    // 重新拉题目详情:解答可能刚由 start 生成,判题结果也刷新了
+    DATA = await fetch("/api/problems/"+encodeURIComponent(CUR)).then(r=>r.json());
+    renderResult(DATA.verdict);
+    renderCode();
+    await loadList();
+  }
+}
+
+/* ---------- 判题结果 ---------- */
+function fmt(v, n=3){
+  if(v === null || v === undefined) return "—";
+  if(typeof v !== "number") return esc(v);
+  return Math.abs(v) >= 1e5 || (Math.abs(v) < 1e-3 && v !== 0)
+    ? v.toExponential(2) : v.toFixed(n).replace(/\.?0+$/,"");
+}
+
+function renderResult(v){
+  const el = $("#p-result");
+  if(!v){ el.innerHTML = `<div class="empty">还没有判题结果 —— 去「解答」页点一下 test</div>`; return; }
+
+  const g = v.grade || "";
+  const req = v.required_grade;
+  const head = `<div class="card"><div class="verdict">
+    <span class="big" style="color:var(--${v.passed?"ok":"bad"})">
+      ${v.passed ? "✅ 通过" : "✗ 未通过"}</span>
+    ${g?`<span class="grade g-${esc(g)}">${esc(g)}</span>`:""}
+    ${req?`<span class="meta">本题要求 ${esc(req)} 级</span>`:""}
+    <span class="meta" style="margin-left:auto">
+      判题耗时 ${fmt(v.seconds,1)}s
+      ${v.created_at?`· ${new Date(v.created_at*1000).toLocaleString()}`:""}</span>
+  </div>
+  ${v.grade_short?`<div class="hint" style="margin-top:10px">
+    正确性没问题,但这道题要求性能达到 <b>${esc(req)}</b> 级 —— 目前是
+    <b>${esc(g||"无法评级")}</b> 级。这是一道优化题:把它改快才是目标。</div>`:""}
+  ${v.build?`<div class="meta" style="margin-top:8px">
+    ${v.build.ok?"编译 ✓":"编译 ✗"} ${fmt(v.build.seconds,1)}s</div>`:""}
+  </div>`;
+
+  let cases = "";
+  if(v.cases && v.cases.length){
+    cases = `<div class="card"><table class="cases">
+      <thead><tr><th>用例</th><th>参数</th><th>正确性</th><th>稳定性</th>
+        <th>性能</th><th>评级</th></tr></thead><tbody>` +
+      v.cases.map(c=>{
+        const raw = c.raw || {}, outs = raw.outputs || [];
+        const bad = outs.reduce((a,o)=>a+(o.bad||0),0);
+        const errs = outs.filter(o=>o.bad).map(o=>o.name+": "+o.bad+
+          " 个不对,最大误差 "+fmt(o.max_abs_err)).join("; ");
+        const gd = raw.guards || {};
+        const gset = Object.entries(gd).filter(([,x])=>x.front||x.back)
+          .map(([n,x])=>`${n} 越界${x.front?"前"+x.front:""}${x.back?"后"+x.back:""}`);
+        const perf = c.perf || {};
+        let p = "—";
+        if(perf.median_ms!=null){
+          p = fmt(perf.median_ms,3)+" ms";
+          if(perf.gb_per_s>0) p += " · "+fmt(perf.gb_per_s,0)+" GB/s";
+          if(c.speedup!=null) p += " · "+fmt(c.speedup,2)+"x";
+        }
+        if(c.too_small) p += `<br><span class="meta">样本太小,不评级</span>`;
+        return `<tr>
+          <td>${esc(c.case)}${c.ok?"":" <b style='color:var(--bad)'>✗</b>"}</td>
+          <td class="mono">${Object.entries(raw.params||{}).map(([k,x])=>k+"="+x).join(", ")}</td>
+          <td>${c.ok?"✓":"✗ " + esc(errs||"不对")}
+              ${gset.length?`<br><span style="color:var(--warn)">${esc(gset.join("; "))}</span>`:""}</td>
+          <td>${c.repeats_ok}/${c.repeats}</td>
+          <td>${p}</td>
+          <td class="${c.grade?"g-"+esc(c.grade):""}"><b>${esc(c.grade||"—")}</b></td>
+        </tr>`;
+      }).join("") + `</tbody></table></div>`;
+  }
+
+  const hints = (v.hints||[]).length
+    ? `<div class="card"><h3 style="margin:0 0 8px;font-size:14px">提示</h3>` +
+      v.hints.map(h=>`<div class="hint">${esc(h)}</div>`).join("") + `</div>` : "";
+
+  const checks = (v.checks||[]).length
+    ? `<div class="card"><h3 style="margin:0 0 8px;font-size:14px">内存/竞态检查</h3>` +
+      v.checks.map(c=>`<div class="hint">${esc(c.tool)}:
+        ${c.skipped?"跳过("+esc(c.skip_reason||"")+")":(c.ok?"✓ ":"✗ ")+esc(c.summary)}
+        ${c.seconds?`<span class="meta"> ${fmt(c.seconds,1)}s</span>`:""}</div>`).join("") + `</div>` : "";
+
+  const blog = (v.build && v.build.log)
+    ? `<div class="card"><details><summary>编译输出</summary>
+        <pre class="out" style="margin-top:8px">${esc(v.build.log)}</pre></details></div>` : "";
+
+  el.innerHTML = head + cases + hints + checks + blog;
+}
+
+/* ---------- tab ---------- */
+function tab(name){
+  for(const t of document.querySelectorAll(".tab"))
+    t.classList.toggle("on", t.dataset.p === name);
+  for(const p of document.querySelectorAll(".pane"))
+    p.classList.toggle("on", p.id === "p-" + name);
+  if(location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
+}
+for(const t of document.querySelectorAll(".tab"))
+  t.onclick = ()=> tab(t.dataset.p);
+
+/* 切走前提醒未保存 */
+window.addEventListener("beforeunload", e=>{ if(DIRTY) e.preventDefault(); });
+
+loadList().then(ps=>{
+  const done = ps.find(p=>p.started) || ps[0];
+  if(done) open(done.id);
+});
+setInterval(()=>{ if(!JOB) loadList().catch(()=>{}); }, 15000);
+</script>
+</body>
+</html>

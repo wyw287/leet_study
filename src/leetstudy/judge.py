@@ -121,7 +121,7 @@ class Verdict:
 # --------------------------------------------------------------------------- #
 
 CACHE_FILENAME = "last_verdict.json"
-_CACHE_VERSION = 1        # 改动 Verdict 结构或判题语义时递增,旧缓存自然失效
+_CACHE_VERSION = 2        # v2:缓存里补上 grade/speedup 等派生字段;旧缓存自然失效
 
 
 def _cache_path(cfg: Config, problem: Problem) -> Path:
@@ -160,6 +160,16 @@ def verdict_signature(problem: Problem, solution_src: Path,
 
 
 def _case_to_dict(cv: CaseVerdict) -> Dict[str, Any]:
+    """把用例结果序列化。
+
+    评级/加速比/带宽占比是**派生字段**。框架自己读回缓存时会用 `score_verdict`
+    全部重算(见 `load_verdict`),**不依赖**这里存的值 —— 所以不存在"两处算法
+    漂移"的问题。
+
+    存它们是为了**终端之外的消费者**(`webui/`):那些消费者拿不到 `score_verdict`,
+    不存就只能自己把评分逻辑抄一遍,那才真的会产生漂移。缓存里这份是每次
+    `leet test` 刚算出来的,与判题结果同源。
+    """
     return {
         "case": cv.case,
         "ok": cv.ok,
@@ -169,6 +179,12 @@ def _case_to_dict(cv: CaseVerdict) -> Dict[str, Any]:
         "repeats_ok": cv.repeats_ok,
         "baseline_raw": cv.baseline.raw if cv.baseline is not None else None,
         "baseline_ok": cv.baseline.ok if cv.baseline is not None else None,
+        # ---- 派生(评分)字段:给外部消费者,框架读回时会重算 ----
+        "grade": cv.grade,
+        "speedup": cv.speedup,
+        "metric_value": cv.metric_value,
+        "bandwidth_pct": cv.bandwidth_pct,
+        "too_small": cv.too_small,
     }
 
 
@@ -183,6 +199,14 @@ def _dict_to_case(d: Dict[str, Any]) -> CaseVerdict:
     return CaseVerdict(
         case=result.case, ok=result.ok, result=result, baseline=baseline,
         repeats=int(d.get("repeats") or 1), repeats_ok=int(d.get("repeats_ok") or 0),
+        # 从缓存恢复派生字段。**注意:调用方 `load_verdict` 随后会用 score_verdict
+        # 把它们全部重算**,所以框架并不依赖这些值 —— 恢复只是为了让 dict↔对象
+        # 的往返保真(有测试和外部消费者会做这个往返)。
+        grade=d.get("grade"),
+        speedup=d.get("speedup"),
+        metric_value=d.get("metric_value"),
+        bandwidth_pct=d.get("bandwidth_pct"),
+        too_small=bool(d.get("too_small")),
     )
 
 
@@ -197,6 +221,11 @@ def save_verdict(cfg: Config, verdict: Verdict, options: Dict[str, Any]) -> None
         "passed": verdict.passed,
         "fatal": verdict.fatal,
         "seconds": verdict.seconds,
+        # 整体评级 + 本题要求的门槛(优化题才有)。同 `_case_to_dict`:
+        # 给终端之外的消费者用,框架读回时照样重算。
+        "grade": verdict.grade,
+        "grade_short": verdict.grade_short,
+        "required_grade": verdict.problem.perf.required_grade,
         "hints": verdict.hints,
         "build": ({"ok": verdict.build.ok, "seconds": verdict.build.seconds,
                    "log": verdict.build.log[:4000]}

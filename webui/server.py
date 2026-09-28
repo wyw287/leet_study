@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""leet_study 的本地 web 界面 —— **独立工具,不 import 框架代码**。
+
+设计立场
+--------
+这个工具**以用户身份**驱动 `leet` CLI,而不是 import `leetstudy`。原因是解耦:
+框架内部 API(`judge.Verdict`、`subjects.Subject` …)可以随便改,只要 `leet`
+命令还能用,这个界面就不用跟着动。
+
+通常「以用户身份调 CLI」的脆弱点是**解析给人看的终端输出**。这个项目不存在
+那个问题 —— web 需要的数据全都有文件级的结构化通道:
+
+    problems/*/spec.yaml           题目定义(YAML,项目自称"唯一驱动代码生成的文件")
+    problems/*/problem.md          题面
+    progress.json                  完成状态与最佳成绩
+    build/*/last_verdict.json      判题结果(逐用例误差/guards/perf/评级 + 中文 hints)
+    solutions/*/solution.*         学习者的代码
+
+所以:**数据一律读文件,"动作"才走 CLI**。唯一的一处例外见 `_read_spec`。
+
+长任务
+------
+`leet test` 要 11~21 秒(CUDA 上下文初始化就占 4.4 秒),`leet bench` 更久。
+所以不能同步处理 HTTP 请求 —— 提交进**单工作线程的队列**,界面轮询进度。
+
+单工作线程不是偷懒:框架的 `build/<题号>/`、`progress.json` 都是单份的,
+同一道题并发跑两次会互相覆盖编译产物。串行执行把这个问题从根上消掉。
+
+安全
+----
+这个工具的本质是**跑任意学习者代码**(nvcc/g++ 编译并执行解答),那就是
+RCE by design。所以默认只绑 127.0.0.1,不要暴露到网络。
+
+用法
+----
+    python3 webui/server.py            # 默认 http://127.0.0.1:8765
+    python3 webui/server.py --port 9000
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    sys.exit("缺 PyYAML。用项目的 venv 跑:`.venv/bin/python webui/server.py`")
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent                      # 仓库根(problems/ solutions/ 都在这)
+LEET = ROOT / ".venv" / "bin" / "leet"  # CLI 入口
+
+PROBLEMS_DIR = ROOT / "problems"
+SOLUTIONS_DIR = ROOT / "solutions"
+BUILD_DIR = ROOT / "build"
+PROGRESS = ROOT / "progress.json"
+
+#: 单个任务保留的输出上限(防止 `leet new` 那种长任务把内存吃光)
+MAX_OUTPUT_CHARS = 400_000
+
+#: 允许通过界面触发的动作 → CLI 子命令。
+#: **白名单**,界面传什么都不能越出这几个。
+ACTIONS = {
+    "test": ["test"],
+    "bench": ["bench"],
+    "start": ["start"],
+    "solution": ["solution"],
+}
+
+
+# --------------------------------------------------------------------------- #
+# 数据读取(全部走文件,不解析终端输出)
+# --------------------------------------------------------------------------- #
+
+def _read_spec(problem_id: str) -> Optional[Dict[str, Any]]:
+    """读一道题的 spec.yaml。
+
+    这是本工具**唯一**直接依赖框架数据格式的地方 —— 但它依赖的是 spec.yaml,
+    而不是 Python API。spec.yaml 是出题文档里公开的契约(「机器可读定义」),
+    比 import 内部类稳定得多。
+    """
+    path = PROBLEMS_DIR / problem_id / "spec.yaml"
+    if not path.is_file():
+        return None
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+def _safe_id(problem_id: str) -> Optional[str]:
+    """把 id 解析成题库里真实存在的目录名(挡掉路径穿越)。"""
+    if not problem_id or not re.fullmatch(r"[A-Za-z0-9_.-]+", problem_id):
+        return None
+    return problem_id if (PROBLEMS_DIR / problem_id).is_dir() else None
+
+
+def _solution_path(problem_id: str) -> Optional[Path]:
+    """找到解答文件。用 glob 而不是查表 —— 这样不必知道各科目的文件名约定。"""
+    d = SOLUTIONS_DIR / problem_id
+    if not d.is_dir():
+        return None
+    for p in sorted(d.iterdir()):
+        if p.is_file() and p.name.startswith("solution"):
+            return p
+    return None
+
+
+def _read_progress() -> Dict[str, Any]:
+    if not PROGRESS.is_file():
+        return {}
+    try:
+        return (json.loads(PROGRESS.read_text(encoding="utf-8")) or {}).get("problems") or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _read_verdict(problem_id: str) -> Optional[Dict[str, Any]]:
+    """读上次判题结果。
+
+    `leet test` 每次都会刷新它;里面已经有评级、加速比、逐用例误差与 guards,
+    还有框架生成好的中文 hints —— 界面直接用,不重算、不解析。
+    """
+    path = BUILD_DIR / problem_id / "last_verdict.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _list_problems() -> List[Dict[str, Any]]:
+    progress = _read_progress()
+    out: List[Dict[str, Any]] = []
+    if not PROBLEMS_DIR.is_dir():
+        return out
+    for d in sorted(PROBLEMS_DIR.iterdir()):
+        if not d.is_dir() or not (d / "spec.yaml").is_file():
+            continue
+        spec = _read_spec(d.name) or {}
+        pr = progress.get(d.name) or {}
+        out.append({
+            "id": d.name,
+            "title": spec.get("title") or d.name,
+            "subject": spec.get("subject") or "cuda",
+            "difficulty": spec.get("difficulty"),
+            "tags": spec.get("tags") or [],
+            "concepts": spec.get("concepts") or [],
+            "cases": len(spec.get("cases") or []),
+            "metric": (spec.get("perf") or {}).get("metric"),
+            "required_grade": (spec.get("perf") or {}).get("required_grade"),
+            "solved": bool(pr.get("solved")),
+            "best_grade": pr.get("best_grade"),
+            "best_metric": pr.get("best_metric"),
+            "metric_name": pr.get("metric_name"),
+            "attempts": pr.get("attempts"),
+            "started": _solution_path(d.name) is not None,
+        })
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 任务队列
+# --------------------------------------------------------------------------- #
+
+class Job:
+    __slots__ = ("id", "problem_id", "action", "argv", "status", "output",
+                 "returncode", "created", "started", "finished", "error")
+
+    def __init__(self, problem_id: str, action: str, argv: List[str]):
+        self.id = uuid.uuid4().hex[:12]
+        self.problem_id = problem_id
+        self.action = action
+        self.argv = argv
+        self.status = "queued"           # queued | running | done | failed
+        self.output = ""
+        self.returncode: Optional[int] = None
+        self.created = time.time()
+        self.started: Optional[float] = None
+        self.finished: Optional[float] = None
+        self.error: Optional[str] = None
+
+    def append(self, text: str) -> None:
+        self.output += text
+        if len(self.output) > MAX_OUTPUT_CHARS:      # 只留尾巴,长任务不涨内存
+            self.output = self.output[-MAX_OUTPUT_CHARS:]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id, "problem_id": self.problem_id, "action": self.action,
+            "status": self.status, "output": self.output,
+            "returncode": self.returncode, "error": self.error,
+            "seconds": round((self.finished or time.time())
+                             - (self.started or self.created), 2),
+        }
+
+
+class JobQueue:
+    """单工作线程的串行队列 —— 见模块 docstring 里"为什么串行"。"""
+
+    def __init__(self, cwd: Path):
+        self.cwd = cwd
+        self._q: "queue.Queue[Job]" = queue.Queue()
+        self._jobs: Dict[str, Job] = {}
+        self._lock = threading.Lock()
+        self._current: Optional[Job] = None
+        t = threading.Thread(target=self._run, daemon=True, name="leet-worker")
+        t.start()
+
+    def submit(self, problem_id: str, action: str) -> Job:
+        argv = list(ACTIONS[action]) + [problem_id]
+        job = Job(problem_id, action, argv)
+        with self._lock:
+            self._jobs[job.id] = job
+        self._q.put(job)
+        return job
+
+    def get(self, job_id: str) -> Optional[Job]:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            running = self._current.id if self._current else None
+            pending = self._q.qsize()
+        return {"running": running, "pending": pending}
+
+    def _run(self) -> None:
+        while True:
+            job = self._q.get()
+            with self._lock:
+                self._current = job
+            job.status = "running"
+            job.started = time.time()
+            try:
+                self._exec(job)
+            except Exception as exc:                       # noqa: BLE001
+                job.status = "failed"
+                job.error = f"{type(exc).__name__}: {exc}"
+            finally:
+                job.finished = time.time()
+                if job.status == "running":
+                    job.status = "done" if job.returncode == 0 else "failed"
+                with self._lock:
+                    self._current = None
+
+    def _exec(self, job: Job) -> None:
+        env = dict(os.environ)
+        # CLI 要靠 PATH 找自己(nvcc / compute-sanitizer / ninja 等)
+        env["PATH"] = f"{LEET.parent}:{env.get('PATH', '')}"
+        proc = subprocess.Popen(
+            [str(LEET)] + job.argv,
+            cwd=str(self.cwd), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:                 # 逐行读,界面能看到实时进度
+            job.append(line)
+        job.returncode = proc.wait()
+
+
+JOBS: Optional[JobQueue] = None
+
+
+# --------------------------------------------------------------------------- #
+# HTTP
+# --------------------------------------------------------------------------- #
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "leet-webui/1.0"
+
+    # ---- 工具 ---- #
+    def _send_json(self, obj: Any, code: int = 200) -> None:
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, text: str, code: int = 200,
+                   ctype: str = "text/plain; charset=utf-8") -> None:
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body_json(self) -> Dict[str, Any]:
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8")) or {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+
+    def log_message(self, fmt: str, *args: Any) -> None:      # 安静一点
+        if os.environ.get("LEET_WEBUI_VERBOSE"):
+            super().log_message(fmt, *args)
+
+    # ---- 路由 ---- #
+    def do_GET(self) -> None:                                  # noqa: N802
+        path = self.path.split("?", 1)[0]
+
+        if path in ("/", "/index.html"):
+            html = (HERE / "index.html").read_text(encoding="utf-8")
+            return self._send_text(html, ctype="text/html; charset=utf-8")
+
+        if path == "/api/problems":
+            return self._send_json({"problems": _list_problems(),
+                                    "queue": JOBS.snapshot() if JOBS else {}})
+
+        if path == "/api/highlight.css":
+            return self._send_text(_highlight_css(), ctype="text/css; charset=utf-8")
+
+        m = re.fullmatch(r"/api/problems/([^/]+)", path)
+        if m:
+            pid = _safe_id(m.group(1))
+            if not pid:
+                return self._send_json({"error": "没有这道题"}, 404)
+            spec = _read_spec(pid) or {}
+            stmt = PROBLEMS_DIR / pid / (spec.get("statement") or "problem.md")
+            sol = _solution_path(pid)
+            opt = PROBLEMS_DIR / pid / _optimal_name(pid)
+            opt_src = opt.read_text(encoding="utf-8") if opt.is_file() else ""
+            sol_src = sol.read_text(encoding="utf-8") if sol else ""
+            return self._send_json({
+                "id": pid, "spec": spec,
+                "statement": stmt.read_text(encoding="utf-8") if stmt.is_file() else "",
+                "solution_path": str(sol.relative_to(ROOT)) if sol else None,
+                "solution": sol_src,
+                "optimal": opt_src,
+                # 高亮后的 HTML(服务端渲染)。拿不到 pygments 时是 null,
+                # 前端退回纯文本 —— 见 _highlight 的说明。
+                "optimal_html": _highlight(opt_src, _lang_of(opt) if opt.is_file() else None),
+                "solution_lang": _lang_of(sol),
+                "verdict": _read_verdict(pid),
+            })
+
+        if path == "/api/queue":
+            return self._send_json(JOBS.snapshot() if JOBS else {})
+
+        m = re.fullmatch(r"/api/jobs/([^/]+)", path)
+        if m:
+            job = JOBS.get(m.group(1)) if JOBS else None
+            if not job:
+                return self._send_json({"error": "没有这个任务"}, 404)
+            return self._send_json(job.to_dict())
+
+        return self._send_json({"error": "没有这个路径"}, 404)
+
+    def do_PUT(self) -> None:                                   # noqa: N802
+        m = re.fullmatch(r"/api/problems/([^/]+)/solution", self.path.split("?", 1)[0])
+        if not m:
+            return self._send_json({"error": "没有这个路径"}, 404)
+        pid = _safe_id(m.group(1))
+        if not pid:
+            return self._send_json({"error": "没有这道题"}, 404)
+
+        payload = self._body_json()
+        src = payload.get("source")
+        if not isinstance(src, str):
+            return self._send_json({"error": "缺 source 字段"}, 400)
+
+        path = _solution_path(pid)
+        if path is None:
+            return self._send_json(
+                {"error": "这道题还没有工作区,先点「开始做题」(leet start)"}, 409)
+        try:
+            path.write_text(src, encoding="utf-8")
+        except OSError as exc:
+            return self._send_json({"error": f"写不进去:{exc}"}, 500)
+        return self._send_json({"ok": True, "path": str(path.relative_to(ROOT))})
+
+    def do_POST(self) -> None:                                  # noqa: N802
+        path = self.path.split("?", 1)[0]
+
+        # 给编辑器的实时高亮:前端防抖后把源码发过来,换回高亮 HTML。
+        # 走服务端而不是在前端塞一个高亮库,是为了和「参考解」页共用同一套
+        # 着色规则 —— 两处各渲染一份迟早会不一样。
+        if path == "/api/highlight":
+            payload = self._body_json()
+            html = _highlight(str(payload.get("source") or ""),
+                              str(payload.get("lang") or "") or None)
+            return self._send_json({"html": html})   # null = 前端退回纯文本
+
+        m = re.fullmatch(r"/api/problems/([^/]+)/(\w+)", path)
+        if not m:
+            return self._send_json({"error": "没有这个路径"}, 404)
+        pid = _safe_id(m.group(1))
+        action = m.group(2)
+        if not pid:
+            return self._send_json({"error": "没有这道题"}, 404)
+        if action not in ACTIONS:
+            return self._send_json(
+                {"error": f"不允许的动作 {action};可用:{' / '.join(ACTIONS)}"}, 400)
+
+        job = JOBS.submit(pid, action) if JOBS else None
+        if job is None:
+            return self._send_json({"error": "任务队列没起来"}, 500)
+        return self._send_json({"job": job.to_dict()}, 202)
+
+
+def _optimal_name(problem_id: str) -> str:
+    """参考解的文件名。
+
+    按科目推断(框架里各科目自己声明 optimal_filename)。这里做一份最小映射,
+    而不是 import 框架 —— 代价是新科目要在这里补一行,收益是 web 工具完全不依赖
+    框架的 Python API。
+    """
+    spec = _read_spec(problem_id) or {}
+    return {"cuda": "optimal.cu", "cpp": "optimal.cpp",
+            "pytorch": "optimal.py"}.get(spec.get("subject") or "cuda", "optimal.cu")
+
+
+# --------------------------------------------------------------------------- #
+# 语法高亮
+#
+# 用 **Pygments**,而且刻意用它而不是前端库:
+#
+# * 它**已经在 venv 里** —— `rich` 依赖它,所以零新增依赖。
+# * 它**能区分语言**,而这不是可有可无的:`cuda` / `cpp` / `python` 三个 lexer
+#   正好覆盖本项目三种解答(`.cu` / `.cpp` / `.py`)。CUDA 的 `__global__`、
+#   `<<< >>>` 这些只有 cuda lexer 认得出来。
+# * 服务端渲染意味着**不依赖 CDN** —— 这台机器访问国际站点要挂代理,
+#   网页里引 CDN 会让界面在离线/没代理时直接废掉。
+# * 够快:实测 47 行的解答 1.8ms、103 行的参考解 4.1ms,所以连"边打字边高亮"
+#   都撑得住(见 index.html 里的输入防抖)。
+#
+# Pygments 是 pygments 的传递依赖,不是我们直接声明的。真掉了要能退化,
+# 所以 `_highlight` 在拿不到它时返回 None,调用方退回纯文本。
+# --------------------------------------------------------------------------- #
+
+#: 按扩展名选 lexer。和文件内容无关 —— 扩展名在这里就是权威(框架自己也是这么分的)。
+_LEXER_BY_EXT = {
+    ".cu": "cuda", ".cuh": "cuda",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".h": "cpp", ".hpp": "cpp",
+    ".py": "python",
+}
+
+
+def _lang_of(path: Optional[Path]) -> Optional[str]:
+    return _LEXER_BY_EXT.get(path.suffix.lower()) if path else None
+
+
+def _highlight(src: str, lang: Optional[str]) -> Optional[str]:
+    """把源码渲染成带 `<span class="...">` 的高亮 HTML(nowrap,由外层套 <pre>)。
+
+    拿不到 pygments 或语言不认识时返回 None —— 调用方原样走纯文本路径。
+    """
+    if not src or not lang:
+        return None
+    try:
+        from pygments import highlight as _hl
+        from pygments.formatters import HtmlFormatter
+        from pygments.lexers import get_lexer_by_name
+    except ImportError:
+        return None
+    try:
+        return _hl(src, get_lexer_by_name(lang), HtmlFormatter(nowrap=True))
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _highlight_css() -> str:
+    """Pygments 的配色,按深浅色模式给两套。
+
+    只出 token 的颜色规则(nowrap),**背景留给页面自己的 CSS** ——
+    这样代码块的底色跟其余界面一致,不会突然出现一块 Pygments 风格的白/黑底。
+    """
+    try:
+        from pygments.formatters import HtmlFormatter
+    except ImportError:
+        return ""
+    light = HtmlFormatter(style="default").get_style_defs(".hl")
+    dark = HtmlFormatter(style="monokai").get_style_defs(".hl")
+    return f"{light}\n@media (prefers-color-scheme: dark) {{\n{dark}\n}}"
+
+
+def main() -> None:
+    global JOBS
+    ap = argparse.ArgumentParser(description="leet_study 的本地 web 界面")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="绑定地址。默认只绑本机 —— 这个工具会执行任意解答代码")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
+    args = ap.parse_args()
+
+    if not LEET.is_file():
+        sys.exit(f"找不到 {LEET}\n先建好 venv:python3 -m venv .venv && .venv/bin/pip install -e .")
+    if not PROBLEMS_DIR.is_dir():
+        sys.exit(f"找不到题库目录 {PROBLEMS_DIR}")
+
+    JOBS = JobQueue(ROOT)
+    url = f"http://{args.host}:{args.port}/"
+    print(f"leet web  →  {url}")
+    print(f"  仓库:{ROOT}")
+    print(f"  CLI :{LEET}")
+    print("  Ctrl-C 退出")
+    if args.open:
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    srv.daemon_threads = True
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n再见")
+
+
+if __name__ == "__main__":
+    main()
