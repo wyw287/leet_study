@@ -1,0 +1,102 @@
+id: 09-row-softmax
+title: 行 Softmax(三趟压成一趟)
+difficulty: 3
+tags: [softmax, fusion, reduction, shared-memory, memory-bound]
+concepts:
+  - 多趟 vs 一趟:同一份数据读三遍,DRAM 流量就是三倍
+  - 数值稳定性:exp 之前必须先减去每行最大值,否则溢出成 inf
+  - 一个 block 负责一行:块内做两次归约(max 与 sum)
+  - 把整行缓存到片上(共享内存 / 寄存器),是"只读一遍"的唯一手段
+  - 为什么"读三遍"要拆成三个 kernel 才真的贵:L2 只有 72MB,一趟就把它冲干净了
+statement: problem.md
+
+# x / y 都是 rows×cols 的行优先矩阵。对每一行独立地做:
+#   m[r]    = max_c ( scale * x[r][c] )
+#   y[r][c] = exp(scale*x[r][c] - m[r]) / Σ_c exp(scale*x[r][c] - m[r])
+buffers:
+  - {name: x, dtype: f32, shape: [rows, cols], role: in}
+  - {name: y, dtype: f32, shape: [rows, cols], role: out}
+  # 逐行的中间量,给基线用(它要三趟)。**它们是本题的线索**:需要把中间量落到
+  # DRAM 里,就说明同一份输入你至少读了两遍。融合成一趟的做法完全不需要它们。
+  - {name: rmax, dtype: f32, shape: [rows], role: scratch}
+  - {name: rsum, dtype: f32, shape: [rows], role: scratch}
+params:
+  - {name: rows,  dtype: i32}
+  - {name: cols,  dtype: i32}
+  # 只是给输入乘一个整数。存在的理由是**逼出数值稳定性**:
+  # 框架的随机输入固定在 [-1,1),不放大就永远看不到 exp 溢出。
+  # scale=100 时 exp 的参数最大到 100,不减最大值就是 inf → NaN。
+  - {name: scale, dtype: i32}
+
+entry:
+  kernel: row_softmax
+  launcher: row_softmax_launch
+
+cases:
+  # 主力用例:8192×4096 = 33.5M 个 float = 134MB 读 + 134MB 写 = 268MB。
+  # 4090 上 DRAM 下限约 266µs,而基线要搬 536MB(≈530µs)—— 这就是优化空间。
+  # 规模取 134MB 而不是更小,是因为它必须**明显大于 L2(72MB)**:
+  # 输入装得进 L2 的话,基线第二三趟的读会命中 L2,差值就没了(见题面第四节)。
+  - {name: square, params: {rows: 8192, cols: 4096, scale: 1}}
+  # 8191 与 4093 都是质数:4093 = 15×256 + 253,跨步循环的尾巴不满;
+  # 而且每行 16372 字节不是 128 的倍数,行首不在 128 字节边界上。
+  # scale=100:数值硬用例 —— 不减去最大值的实现会在这里出 inf/NaN。
+  # 规模与 square 同量级(134MB),保证两个用例的 DRAM 占比可比。
+  - {name: sharp,  params: {rows: 8191, cols: 4093, scale: 100}}
+  # 小到远低于 20µs 的评级下限,所以**不参与评级** —— 专职考边界:
+  # cols=129 比 blockDim(256)还小,一个 block 里大多数线程领不到元素;
+  # 兼跑 racecheck。racecheck 极慢,只能挂在这么小的用例上。
+  - {name: tiny,   params: {rows: 37, cols: 129, scale: 1}}
+
+verify:
+  # softmax 的输出在 [0,1],每行 4096 项。参考解用 double,GPU 用 f32:
+  # exp 本身 ~1e-7 相对误差,4096 项求和的顺序差异 ~1e-6 量级 —— 离 rtol=1e-4 还有两个数量级。
+  # 反过来,错误的实现偏差是 O(1e-4) 以上(正常值本身就有 1/4096≈2.4e-4),
+  # 所以 atol=1e-5 不会放过"全填 0"这类劣化解(2.4e-4 > 1e-5)。
+  atol: 1e-5
+  rtol: 1e-4
+  # repeat=3:这题有共享内存 + 两次块内归约,漏一个 __syncthreads 就会"有时对有时错"
+  repeat: 3
+
+perf:
+  # 纯访存瓶颈:33.5M 次 expf 只要约 7µs(4090 的 SFU 是 5.1e12 次/秒),
+  # 而 268MB 的搬运要 266µs —— 差 40 倍。这题没有"算得更快"的空间。
+  #
+  # 用加速比而不是带宽占比:这里的基线**不是**最优算法(它多读了 268MB),
+  # 加速比直接就是"你把多余的 DRAM 流量去掉了多少",有明确物理含义。
+  # (01/02/07/08 那种"朴素实现已到墙"的题才必须用带宽占比。)
+  bound: memory
+  metric: speedup
+  repeat: 50
+  warmup: 10
+  # 门槛由实测倒推(2026-09-27,4090,框架自动清 L2);评级取所有可评级用例里的最好成绩。
+  # 下面每一行都真写过、真跑过(square 用例:134MB 读 + 134MB 写;sharp 同量级,
+  # 两个大用例的加速比几乎一样,所以只列 square):
+  #
+  #   实现                                     DRAM 流量   square     加速比   评级
+  #   基线:3 个 kernel(max / sum / 归一化)     536MB       0.569 ms   1.00x    —
+  #   2 个 kernel(第一趟同时出 max 与 sum)     402MB       0.426 ms   1.33x    B
+  #   1 个 kernel,三趟都读全局(不缓存行)      268MB       0.246 ms   2.31x    S
+  #   1 个 kernel + 整行进共享内存(参考解)     268MB       0.238 ms   2.39x    S
+  #
+  # 三件值得记下来的事:
+  #   * 第二行的 1.33x 恰好等于 536/402 —— 这道题就是纯粹的 DRAM 流量核算,
+  #     没有别的机制掺和。
+  #   * 按流量算天花板是 2.0x(536/268),实测却到 2.39x:因为基线的两趟
+  #     **纯读**归约并没有跑满带宽(有效带宽约 940GB/s),而融合版约 1100GB/s ——
+  #     后者还含"计时结束时最后一批写仍在 L2 里"的水分,见 01 题的说明。
+  #   * 2.31x 与 2.39x 只差 3%:一个 kernel 内部的重读本来就会命中 L2
+  #     (一行 16KB,L2 有 72MB),所以**融合**是决定性的那一步,
+  #     "把行搬进共享内存"只是最后一点零头。这一点写进了题面第四节。
+  #
+  # 门槛卡在实测的**空隙**里(与 08 题同样的做法):
+  #   B=1.20 —— 高于基线(1.00),低于"两个 kernel"的 1.33:至少要真的去掉一趟
+  #   A=1.60 —— 高于 1.33,低于融合版的 2.31:中间留给"融合了但没融合好"
+  #             (块太大导致占用率掉下来、访存没合并、行缓存用错)
+  #   S=2.10 —— 融合成一趟就能到 2.31,所以 S 要求的是"结构改对了",
+  #             但不要求把最后那 3% 的 L2 往返也省掉
+  grades: {B: 1.20, A: 1.60, S: 2.10}
+
+sanitize:
+  memcheck: true
+  racecheck_case: tiny

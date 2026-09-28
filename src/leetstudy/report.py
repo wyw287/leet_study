@@ -263,8 +263,13 @@ def _render_perf(console: Console, cfg: Config, verdict: Verdict) -> None:
         base_speeds = [(c.case, c.speedup) for c in scored if c.speedup]
         if base_speeds:
             txt = "  ".join(f"{c} {s:.2f}x" for c, s in base_speeds)
-            console.print(f"        [dim]相对基线:{txt}"
-                          f"(访存瓶颈题上基线已近最优,≈1.0x 属正常)[/dim]")
+            # 「基线已近最优」只在这题**真的**没有优化空间时才成立(01/02 那种
+            # 一个线程一个元素的朴素写法即最优)。若基线的加速比明显大于 1
+            # (如 08-gemv 的朴素写法只有峰值的 15%,能到 6x),这句话就是在误导人。
+            best = max(s for _, s in base_speeds)
+            note = ("(访存瓶颈题上基线已近最优,≈1.0x 属正常)"
+                    if best < 1.5 else "")
+            console.print(f"        [dim]相对基线:{txt}{note}[/dim]")
     # 超过标称峰值时说明一下,免得以为是 bug
     if peak and any((c.bandwidth_pct or 0) > 102 for c in scored):
         console.print("        [dim]注:占比略超 100% 是事件计时的固有现象 —— "
