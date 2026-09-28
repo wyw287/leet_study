@@ -89,18 +89,41 @@
   /* ---- 编辑器叠加 ----
      一个透明的 textarea 骑在一份高亮后的 <pre> 上。这样既能编辑又有实时高亮,
      而且高亮规则和「参考解」页是同一套(都来自服务端的 Pygments)。
-     唯一的坑:两层的 font / line-height / padding / tab-size / white-space
-     必须**逐项一致**,差一点光标就会和文字错位。改动这里时别只改一层。 */
-  .ed{position:relative;border:1px solid var(--line);border-radius:9px;
-    overflow:hidden;background:var(--code-bg);height:470px}
-  .ed pre,.ed textarea{margin:0;border:0;padding:12px;box-sizing:border-box;
-    width:100%;height:100%;
+
+     两层的 font / line-height / padding / tab-size / white-space / 各种 wrap
+     必须**逐项一致**,差一点光标就会和文字错位。改动这里时别只改一层。
+
+     **两层都不滚动**:高度由 JS 的 fitEditor() 按内容撑开,纵向交给页面滚;
+     横向用 pre-wrap 折行。这样就不需要"把 textarea 的滚动位置同步给 pre" ——
+     而那个同步正是最初的 bug 来源(pre 里的 <code> 不是滚动容器,同步设了个寂寞,
+     表现就是「滚动条动了、字不动」)。没有滚动,就没有同步可错。 */
+  .ed{position:relative;overflow:hidden;background:var(--code-bg);
+    border:1px solid var(--line);border-radius:9px;height:320px;
+    margin-bottom:14px}
+  .ed pre,.ed textarea{position:absolute;top:0;left:0;width:100%;height:320px;
+    margin:0;border:0;padding:12px;box-sizing:border-box;overflow:hidden;
     font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-    tab-size:4;white-space:pre;letter-spacing:normal;word-spacing:normal}
-  .ed pre{overflow:hidden;background:transparent;pointer-events:none}
-  .ed pre code{font:inherit}
-  .ed textarea{position:absolute;inset:0;background:transparent;color:transparent;
-    caret-color:var(--fg);resize:none;outline:none;overflow:auto}
+    tab-size:4;letter-spacing:normal;word-spacing:normal;
+    white-space:pre-wrap;overflow-wrap:normal;word-break:normal}
+  /* 编辑器里的 pre 要**解掉** pre.hl 的 max-height:560px —— 那是给「参考解」页
+     只读预览用的上限。留在这里的话,高度被卡在 560,而它有 pointer-events:none,
+     鼠标滚不动它 —— 560 以下的内容就永远够不着了。 */
+  .ed pre{background:transparent;pointer-events:none;
+    max-height:none;overflow:hidden}
+  .ed pre code{font:inherit;white-space:inherit;overflow-wrap:inherit}
+  .ed textarea{background:var(--code-bg);color:var(--fg);caret-color:var(--fg);
+    resize:none;outline:none}
+
+  /* 打字期间:textarea 显示自己的文字(原生渲染,零延迟),高亮层藏起来。
+     停下后(见 scheduleHighlight)再切回高亮层。
+
+     为什么必须这样:可见的文字是 <pre> 画的,而它要等防抖 + 服务端往返才更新 ——
+     于是每敲一个字符要过约 200ms 才看得见,手感就是"慢半拍"。
+     服务端高亮不可能做到零延迟,所以只能让"即时反馈"由 textarea 自己负责。
+     两个状态的字形度量完全一致,切换只是颜色变化,不会跳。 */
+  .ed pre{visibility:hidden}
+  .ed.hl-on textarea{color:transparent;background:transparent}
+  .ed.hl-on pre{visibility:visible}
 
   /* 输出 */
   pre.out{background:var(--code-bg);border:1px solid var(--line);border-radius:9px;
@@ -347,12 +370,42 @@ function renderCode(){
   const ed = $("#ed");
   if(ed){
     ed.value = DATA.solution;
-    ed.oninput = ()=>{ DIRTY = true; scheduleHighlight(); };
-    ed.onscroll = syncScroll;
+    ed.oninput = ()=>{
+      DIRTY = true;
+      // 立刻切回"纯文本"态:让敲下的字马上可见,不等高亮往返
+      const box = document.querySelector(".ed");
+      if(box) box.classList.remove("hl-on");
+      scheduleHighlight();
+    };
     // 粘贴/撤销不触发 oninput 的场合,补一次
-    ed.addEventListener("paste", ()=> setTimeout(()=>{ DIRTY=true; scheduleHighlight(); }, 0));
-    highlightNow();
+    ed.addEventListener("paste", ()=> setTimeout(()=>{
+      DIRTY = true; ed.dispatchEvent(new Event("input")); }, 0));
+    // 离开编辑区就立刻高亮(不用等防抖)
+    ed.addEventListener("blur", ()=> highlightNow());
+    fitEditor();
+    ed.dispatchEvent(new Event("input"));   // 初始化:先按纯文本显示,随即高亮
+    ed.dispatchEvent(new Event("blur"));
   }
+}
+
+/* 让编辑器长到刚好装下内容 —— 于是没有内层滚动,纵向交给页面。
+   量高度用的是 **<pre> 的 auto 高度**:它是绝对定位的块元素,`height:auto`
+   时自然按内容撑开,不会像"把 textarea 压到 20px 再量"那样动到编辑区 ——
+   后者会让 textarea 为了保持光标可见而内部滚动,回来就对不齐了。
+
+   ⚠️ 高度要设在 <pre> 上,不是它里面的 <code>(#edhl)。踩过两次:
+   可见的是 <pre>,把 height/scrollTop 设到 <code> 上毫无效果 ——
+   表现是「透明的 textarea 撑开了,可见的高亮层还卡在 320px,下半截一片空白」。 */
+function fitEditor(){
+  const box = document.querySelector(".ed");
+  if(!box) return;
+  const ed = $("#ed"), pre = box.querySelector("pre");
+  if(!ed || !pre) return;
+  pre.style.height = "auto";                      // <pre> 按内容撑高
+  const h = Math.max(320, pre.offsetHeight);
+  pre.style.height = h + "px";
+  ed.style.height = h + "px";
+  box.style.height = h + "px";
 }
 
 /* ---- 实时高亮:防抖 + 过期响应丢弃 ----
@@ -366,13 +419,14 @@ function scheduleHighlight(){
 }
 
 async function highlightNow(){
-  const ed = $("#ed"), box = $("#edhl");
-  if(!ed || !box) return;
+  const box = document.querySelector(".ed");
+  const ed = $("#ed"), hl = $("#edhl");
+  if(!box || !ed || !hl) return;
   const seq = ++hlSeq;
   const src = ed.value;
 
   if(!DATA.solution_lang){                 // 语言认不出来,退回纯文本
-    box.innerHTML = esc(src); syncScroll(); return;
+    hl.innerHTML = esc(src); box.classList.add("hl-on"); fitEditor(); return;
   }
   let html = null;
   try{
@@ -380,16 +434,12 @@ async function highlightNow(){
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({source: src, lang: DATA.solution_lang})});
     html = (await r.json()).html;
-  }catch(_){ /* 网断了就保持上一次的高亮,别把编辑区搞空 */ }
+  }catch(_){ /* 网断了就保持纯文本,别把编辑区搞空 */ }
 
   if(seq !== hlSeq) return;                // 有更新的请求在路上,丢弃这次的
-  box.innerHTML = (html != null) ? html : esc(src);
-  syncScroll();
-}
-
-function syncScroll(){
-  const ed = $("#ed"), box = $("#edhl");
-  if(ed && box){ box.scrollTop = ed.scrollTop; box.scrollLeft = ed.scrollLeft; }
+  hl.innerHTML = (html != null) ? html : esc(src);
+  fitEditor();
+  box.classList.add("hl-on");              // 高亮好了才切过去
 }
 
 async function save(){
