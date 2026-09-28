@@ -432,6 +432,17 @@ class Handler(BaseHTTPRequestHandler):
             html = (HERE / "index.html").read_text(encoding="utf-8")
             return self._send_text(html, ctype="text/html; charset=utf-8")
 
+        # 前端编辑器(CodeMirror 6)的打包产物。**提交进仓库**,不是运行时生成的 ——
+        # 重装/升级的办法见 vendor/BUILD.md。缺了它页面还能用,只是编辑区退化成
+        # 纯文本(前端的 import 失败会走那条路)。
+        if path == "/vendor/codemirror.js":
+            f = HERE / "vendor" / "codemirror.js"
+            if not f.is_file():
+                return self._send_json(
+                    {"error": "前端编辑器产物缺失 —— 见 webui/vendor/BUILD.md"}, 404)
+            return self._send_text(f.read_text(encoding="utf-8"),
+                                   ctype="text/javascript; charset=utf-8")
+
         if path == "/api/problems":
             return self._send_json({"problems": _list_problems(),
                                     "queue": JOBS.snapshot() if JOBS else {}})
@@ -505,14 +516,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:                                  # noqa: N802
         path = self.path.split("?", 1)[0]
 
-        # 给编辑器的实时高亮:前端防抖后把源码发过来,换回高亮 HTML。
-        # 走服务端而不是在前端塞一个高亮库,是为了和「参考解」页共用同一套
-        # 着色规则 —— 两处各渲染一份迟早会不一样。
-        if path == "/api/highlight":
-            payload = self._body_json()
-            html = _highlight(str(payload.get("source") or ""),
-                              str(payload.get("lang") or "") or None)
-            return self._send_json({"html": html})   # null = 前端退回纯文本
+        # 这里原本有一个 POST /api/highlight(前端防抖后把源码发过来换高亮 HTML)。
+        # 编辑区换成 CodeMirror 之后**没有任何调用方了** —— 上色改在浏览器里同步做,
+        # 所以删掉。服务端的 _highlight() 本身还在用(参考解页、题面代码块)。
+        #
+        # 当初之所以让编辑器走服务端高亮,是为了和参考解页共用同一套着色规则。
+        # 现在这个目标由**配色变量**达成:server.py 的 _theme_vars() 把 Pygments
+        # 自己的 CSS 反解成 --py-* 变量,编辑器绑的就是它们 —— 共用的是定义,
+        # 而不是每次渲染的结果,反而更不容易漂移。
 
         m = re.fullmatch(r"/api/problems/([^/]+)/(\w+)", path)
         if not m:
@@ -597,6 +608,9 @@ def _highlight_css() -> str:
 
     只出 token 的颜色规则(nowrap),**背景留给页面自己的 CSS** ——
     这样代码块的底色跟其余界面一致,不会突然出现一块 Pygments 风格的白/黑底。
+
+    末尾会附上 `--py-*` 变量(见 `_theme_vars`),那是给前端编辑器用的:
+    编辑器的配色全绑在这些变量上,于是**编辑器、题面、参考解页共用一份定义**。
     """
     try:
         from pygments.formatters import HtmlFormatter
@@ -604,7 +618,75 @@ def _highlight_css() -> str:
         return ""
     light = HtmlFormatter(style="default").get_style_defs(".hl")
     dark = HtmlFormatter(style="monokai").get_style_defs(".hl")
-    return f"{light}\n@media (prefers-color-scheme: dark) {{\n{dark}\n}}"
+    return (light
+            + "\n:root{" + _theme_vars(light) + "}"
+            + "\n@media (prefers-color-scheme: dark) {\n"
+            + dark
+            + "\n:root{" + _theme_vars(dark) + "}\n}")
+
+
+# --------------------------------------------------------------------------- #
+# 编辑器配色变量
+#
+# 前端的高亮不再走服务端往返(编辑区换成 CodeMirror,在浏览器里同步算),
+# 但配色必须和 Pygments 那套**完全一致** —— 否则同一个词在题面、参考解、
+# 编辑器三处会是三个颜色。
+#
+# 做法是把上面生成的 CSS **反过来解析**一遍,抠出 --py-* 变量。不手抄颜色:
+# 换 Pygments 版本或主题时,编辑器自动跟着变,不会漂移。
+# (实测 340 字符的样本逐字符对照,只剩 1 处差异 —— 预处理指令里的文件名,
+#  Pygments 单独染成注释色,而编辑器把整行 `#include "x.h"` 当一个 token。)
+# --------------------------------------------------------------------------- #
+
+# 变量名 → Pygments 的 token 简写。名字取短的,写 HighlightStyle 时好认。
+_CSS_VARS = (
+    ("k",   "k"),     # Keyword           关键字
+    ("kt",  "kt"),    # Keyword.Type      类型
+    ("c",   "c"),     # Comment           注释
+    ("s",   "s"),     # String            字符串
+    ("num", "m"),     # Number            数字
+    ("o",   "o"),     # Operator          运算符
+    ("nb",  "nb"),    # Name.Builtin      内建(threadIdx 这类)
+    ("nf",  "nf"),    # Name.Function     函数名
+    ("cp",  "cp"),    # Comment.Preproc   预处理指令
+    ("kc",  "kc"),    # Keyword.Constant  true / false / NULL
+)
+
+
+def _css_rule(css: str, cls: str) -> str:
+    """抠出 `.hl .<cls> { … }` 的声明体,没有就是空串。"""
+    m = re.search(r"^\.hl \.%s \{([^}]*)\}" % re.escape(cls), css, re.M)
+    return m.group(1) if m else ""
+
+
+def _css_color(css: str, cls: str) -> str:
+    m = re.search(r"color:\s*([^;]+)", _css_rule(css, cls))
+    return m.group(1).strip() if m else "inherit"
+
+
+def _css_base(css: str) -> str:
+    """Pygments 在 `.hl` 上设的**基准正文色**。
+
+    default 主题不设(于是继承页面色),monokai 会设成 #f8f8f2。编辑器如果不
+    跟着设,暗色下整屏代码会比参考解页暗一档(230 vs 248),看着像失焦。
+    """
+    m = re.search(r"^\.hl \{([^}]*)\}", css, re.M)
+    if m:
+        c = re.search(r"color:\s*([^;]+)", m.group(1))
+        if c:
+            return c.group(1).strip()
+    return "inherit"
+
+
+def _theme_vars(css: str) -> str:
+    """从一份 Pygments CSS 里导出编辑器要用的全部 --py-* 变量。"""
+    out = ["--py-base:%s;" % _css_base(css)]
+    for var, cls in _CSS_VARS:
+        rule = _css_rule(css, cls)
+        out.append("--py-%s:%s;" % (var, _css_color(css, cls)))
+        out.append("--py-%s-w:%s;" % (var, "bold" if "font-weight: bold" in rule else "normal"))
+        out.append("--py-%s-s:%s;" % (var, "italic" if "font-style: italic" in rule else "normal"))
+    return "".join(out)
 
 
 # --------------------------------------------------------------------------- #

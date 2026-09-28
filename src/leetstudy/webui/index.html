@@ -4,8 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>leet web</title>
-<!-- Pygments 的 token 配色,服务端按扩展名选 lexer(见 server.py 的 _highlight) -->
-<link rel="stylesheet" href="/api/highlight.css">
+<!-- Pygments 的 token 配色。href 留空,由下面的脚本按 API 基地址补上 ——
+     写成 href="/api/highlight.css" 是**根相对**的,前端一旦单独部署
+     (见下面的 API 说明),它就会指向前端自己那个源,静默 404。
+     症状很隐蔽:页面照常打开,只是所有代码都是黑白的,没有任何报错。 -->
+<link rel="stylesheet" id="hlcss">
 <style>
   :root{
     --bg:#f6f7f9; --panel:#fff; --fg:#1c1f23; --dim:#6b7280; --line:#e3e6ea;
@@ -78,55 +81,48 @@
   button.act.running{opacity:1;border-color:var(--accent);color:var(--accent)}
   .status{color:var(--dim);font-size:12px;margin-left:auto}
 
-  /* 编辑器 */
-  textarea{width:100%;min-height:440px;padding:12px;border-radius:9px;
-    border:1px solid var(--line);background:var(--code-bg);color:var(--fg);
-    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-    font-size:13px;line-height:1.55;resize:vertical;tab-size:4}
-
-  /* ---- 只读高亮(参考解)---- */
+  /* ---- 只读高亮(参考解 / 题面里的代码块)----
+     这条留着:**只读**的地方仍然走服务端 Pygments。没有延迟问题,而且服务端
+     渲染出来的 HTML 不依赖 JS。编辑区才需要 CM6(见下)。 */
   pre.hl{margin:0;padding:12px;border:1px solid var(--line);border-radius:9px;
     background:var(--code-bg);overflow:auto;max-height:560px;font-size:12.5px;
     line-height:1.55;white-space:pre;tab-size:4}
 
-  /* ---- 编辑器叠加 ----
-     一个透明的 textarea 骑在一份高亮后的 <pre> 上。这样既能编辑又有实时高亮,
-     而且高亮规则和「参考解」页是同一套(都来自服务端的 Pygments)。
+  /* ---- 编辑器(CodeMirror 6)----
+     编辑和上色**都在浏览器里同步做** —— 没有服务端往返,于是没有防抖,
+     也没有「打字时先看纯色、停下再整块变彩色」那一下闪。
 
-     两层的 font / line-height / padding / tab-size / white-space / 各种 wrap
-     必须**逐项一致**,差一点光标就会和文字错位。改动这里时别只改一层。
+     配色全部来自 --py-* 变量,而那些变量是服务端的 /api/highlight.css 从
+     Pygments 自己的 CSS 里反解出来的(见 server.py 的 _theme_vars)——
+     所以编辑器、题面、参考解页共用同一份定义,换主题时三处一起变。
 
-     **两层都不滚动**:高度由 JS 的 fitEditor() 按内容撑开,纵向交给页面滚;
-     横向用 pre-wrap 折行。这样就不需要"把 textarea 的滚动位置同步给 pre" ——
-     而那个同步正是最初的 bug 来源(pre 里的 <code> 不是滚动容器,同步设了个寂寞,
-     表现就是「滚动条动了、字不动」)。没有滚动,就没有同步可错。 */
-  .ed{position:relative;overflow:hidden;background:var(--code-bg);
-    border:1px solid var(--line);border-radius:9px;height:320px;
-    margin-bottom:14px}
-  .ed pre,.ed textarea{position:absolute;top:0;left:0;width:100%;height:320px;
-    margin:0;border:0;padding:12px;box-sizing:border-box;overflow:hidden;
-    font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-    tab-size:4;letter-spacing:normal;word-spacing:normal;
-    white-space:pre-wrap;overflow-wrap:normal;word-break:normal}
-  /* 编辑器里的 pre 要**解掉** pre.hl 的 max-height:560px —— 那是给「参考解」页
-     只读预览用的上限。留在这里的话,高度被卡在 560,而它有 pointer-events:none,
-     鼠标滚不动它 —— 560 以下的内容就永远够不着了。 */
-  .ed pre{background:transparent;pointer-events:none;
-    max-height:none;overflow:hidden}
-  .ed pre code{font:inherit;white-space:inherit;overflow-wrap:inherit}
-  .ed textarea{background:var(--code-bg);color:var(--fg);caret-color:var(--fg);
-    resize:none;outline:none}
-
-  /* 打字期间:textarea 显示自己的文字(原生渲染,零延迟),高亮层藏起来。
-     停下后(见 scheduleHighlight)再切回高亮层。
-
-     为什么必须这样:可见的文字是 <pre> 画的,而它要等防抖 + 服务端往返才更新 ——
-     于是每敲一个字符要过约 200ms 才看得见,手感就是"慢半拍"。
-     服务端高亮不可能做到零延迟,所以只能让"即时反馈"由 textarea 自己负责。
-     两个状态的字形度量完全一致,切换只是颜色变化,不会跳。 */
-  .ed pre{visibility:hidden}
-  .ed.hl-on textarea{color:transparent;background:transparent}
-  .ed.hl-on pre{visibility:visible}
+     高度固定、内部滚动。原来那套叠加式做法(透明 textarea 骑在高亮 <pre> 上)
+     要求两层 font/line-height/padding/tab-size **逐项对齐**,还得靠 fitEditor()
+     按内容撑高、靠 syncScroll 同步滚动位置 —— 那些全是因为"没有真正的编辑控件"
+     才存在的。有 CM6 之后整块作废。 */
+  .cm-host{border:1px solid var(--line);border-radius:9px;overflow:hidden;
+    background:var(--code-bg);margin-bottom:14px}
+  /* 退化路径:vendor/codemirror.js 加载失败时用的纯文本编辑框 */
+  .cm-host textarea{display:block;width:100%;height:min(62vh,720px);padding:12px;
+    border:0;background:var(--code-bg);color:var(--fg);resize:vertical;tab-size:4;
+    outline:none;
+    font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .cm-editor{color:var(--py-base,inherit);
+    font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .cm-editor.cm-focused{outline:none}
+  .cm-scroller{font-family:inherit;overflow:auto;height:min(62vh,720px)}
+  .cm-content{padding:12px 0}
+  .cm-line{padding:0 12px}
+  .cm-gutters{background:var(--code-bg);border:none;border-right:1px solid var(--line);
+    color:var(--dim)}
+  .cm-activeLine{background:transparent}
+  .cm-activeLineGutter{background:transparent;color:var(--fg)}
+  .cm-cursor{border-left-color:var(--fg)}
+  .cm-panels{background:var(--panel);color:var(--fg);border-color:var(--line)}
+  .cm-panels input,.cm-panels button{font:inherit;padding:3px 8px;border-radius:5px;
+    border:1px solid var(--line);background:var(--panel);color:var(--fg)}
+  .cm-searchMatch{background:rgba(255,196,0,.35)}
+  .cm-searchMatch.cm-searchMatch-selected{background:rgba(255,140,0,.5)}
 
   /* 输出 */
   pre.out{background:var(--code-bg);border:1px solid var(--line);border-radius:9px;
@@ -271,7 +267,9 @@
 </div>
 <div class="toast" id="toast"></div>
 
-<script>
+<!-- 必须是 module:编辑器是动态 `import()` 进来的(见下面的启动块)。
+     module 是延迟执行的,所以放在 body 末尾和以前行为一致。 -->
+<script type="module">
 "use strict";
 /* API 基地址。默认空串 = **同源**(`leet web` 自己吐页面时就是这种用法)。
    想把前端放到别处跑(比如 localhost:3000 的静态服务器),两种办法指定:
@@ -288,6 +286,138 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+/* 高亮配色表同样要按 API 基地址取 —— 下面那些 fetch 都用了 API,唯独这个
+   <link> 漏了,于是单独部署时它 404,而**页面不会有任何报错**,只是所有
+   代码变成黑白的。自检里是靠"token 颜色 == --py-* 变量"这一条抓出来的。 */
+$("#hlcss").href = API + "/api/highlight.css";
+
+/* ---------- 编辑器:CodeMirror 6 ----------
+   产物是 vendor/codemirror.js(构建方法见 webui/vendor/BUILD.md)。
+   **从 API 那个源加载**,不是页面自己的源 —— 前端可以单独部署到别的端口/机器
+   (见本文件顶部的说明),那时页面旁边并没有 vendor/ 目录。跨源加载 ES module
+   需要 CORS,服务端已经按 --allow-origin 的白名单放行了。
+
+   加载**不阻塞页面**:题库列表和题面先出来,编辑器包到了再挂上。这里刻意不用
+   顶层 await —— 那会让整个 module 挂起,页面得等这 346 KB(113 KB gzip)落地
+   才开始拉题库,而这两件事毫无关系。
+
+   加载失败不致命:退化成纯文本 textarea。写代码总得有地方写。 */
+let CM = null, HL = null, MODES = {};
+const CM_READY = import(API + "/vendor/codemirror.js").then(m => {
+  CM = m;
+  MODES = {cuda: m.cuda, cpp: m.cpp, python: m.python};
+
+  /* 配色**没有一个是硬编码的**,全部绑到 --py-* 变量。那些变量由服务端的
+     /api/highlight.css 从 Pygments 自己生成的 CSS 里反解出来(见 server.py 的
+     _theme_vars,变量名到 token 的对应在那里)。于是编辑器、题面、参考解页
+     共用一份配色定义 —— 换 Pygments 主题时三处一起变,不会漂移。
+
+     注意**普通标识符故意不设规则**:Pygments 的 default 主题也没给 Name 上色,
+     不设规则正好同样是继承正文色(--py-base)。给它们随便指定一个颜色
+     (比如内建色)是原型阶段踩过的坑 —— 用户一眼就看出"变量名怎么变绿了"。 */
+  const t = m.tags;
+  HL = m.HighlightStyle.define([
+    {tag: t.keyword,                    color:"var(--py-k)",   fontWeight:"var(--py-k-w)"},
+    {tag: t.controlKeyword,             color:"var(--py-k)",   fontWeight:"var(--py-k-w)"},
+    {tag: t.moduleKeyword,              color:"var(--py-k)",   fontWeight:"var(--py-k-w)"},
+    {tag: t.atom,                       color:"var(--py-kc)",  fontWeight:"var(--py-kc-w)"},
+    {tag: t.bool,                       color:"var(--py-kc)",  fontWeight:"var(--py-kc-w)"},
+    {tag: t.null,                       color:"var(--py-kc)",  fontWeight:"var(--py-kc-w)"},
+    {tag: t.typeName,                   color:"var(--py-kt)"},
+    {tag: t.comment,                    color:"var(--py-c)",   fontStyle:"var(--py-c-s)"},
+    {tag: t.lineComment,                color:"var(--py-c)",   fontStyle:"var(--py-c-s)"},
+    {tag: t.blockComment,               color:"var(--py-c)",   fontStyle:"var(--py-c-s)"},
+    {tag: t.meta,                       color:"var(--py-cp)"},
+    {tag: t.processingInstruction,      color:"var(--py-cp)"},
+    {tag: t.string,                     color:"var(--py-s)"},
+    {tag: t.special(t.string),          color:"var(--py-cp)"},
+    {tag: t.number,                     color:"var(--py-num)"},
+    {tag: t.operator,                   color:"var(--py-o)"},
+    {tag: t.standard(t.variableName),   color:"var(--py-nb)"},   // threadIdx 这类内建
+  ]);
+}).catch(e => {
+  console.warn("CodeMirror 加载失败,编辑区退化为纯文本:", e);
+});
+
+let VIEW = null;         // CodeMirror 实例(加载成功时)
+let PLAIN = null;        // 退化路径用的 textarea
+let TAB_ESC = false;     // 按过 Esc 之后的那次 Tab 放行给浏览器
+let ED_GEN = 0;          // 编辑器代次 —— 用来作废"还没挂完就被换掉"的那次挂载
+
+const UNIT = "    ";     // 4 空格 —— 仓库里的解答/模板/参考解统一用空格,没有 Tab
+
+function editorText(){
+  if(VIEW) return VIEW.state.doc.toString();
+  if(PLAIN) return PLAIN.value;
+  return null;
+}
+
+function destroyEditor(){
+  ED_GEN++;              // 让所有在飞的 mountEditor 作废
+  if(VIEW){ VIEW.destroy(); VIEW = null; }
+  PLAIN = null;
+}
+
+function onEdit(){ isDirty() ? markDirty() : markSaved(); }
+
+/* 挂编辑器。**异步**:要等编辑器包到位。但第一次之后它就已经在内存里了,
+   await 一个已完成的 promise 只让出一个微任务,等于同步。
+
+   ★ 挂之前要确认自己**还是当前那一次**:等包的这段时间里用户可能已经点了别的
+   题(或页面自己换了题),那时这个 host 已经从文档里摘掉、VIEW 也换了主人。
+   两个条件缺一不可:
+     · host.isConnected —— 容器还在文档里
+     · gen === ED_GEN    —— 期间没有人调用过 destroyEditor()
+   只查 isConnected 不够:第一次挂载可能恰好在第二次 destroyEditor 之后才
+   醒来,那时它挂进去的实例没人认识,页面却会永远留着它那份文档 ——
+   表现为"编辑器里打字的和保存下去的不是同一份"。 */
+async function mountEditor(host, src, lang){
+  const gen = ED_GEN;
+  await CM_READY;
+  if(gen !== ED_GEN || !host.isConnected) return;
+
+  if(!CM){                                  // 退化:纯文本,但能编辑/保存/判题
+    PLAIN = document.createElement("textarea");
+    PLAIN.spellcheck = false;
+    PLAIN.value = src;
+    PLAIN.addEventListener("input", onEdit);
+    host.appendChild(PLAIN);
+    return;
+  }
+  VIEW = new CM.EditorView({
+    parent: host,
+    state: CM.EditorState.create({
+      doc: src,
+      extensions: [
+        CM.lineNumbers(), CM.highlightActiveLineGutter(), CM.highlightActiveLine(),
+        CM.drawSelection(), CM.bracketMatching(), CM.history(),
+        CM.highlightSelectionMatches(),
+        CM.indentUnit.of(UNIT),
+        CM.keymap.of([
+          /* Esc 之后的那次 Tab 放行给浏览器 —— 否则纯键盘用户会被困在编辑区里
+             出不来(defaultKeymap 故意不绑 Tab,也是这个理由)。返回 false 时
+             CM6 不调 preventDefault,事件照常冒泡给浏览器。 */
+          {key:"Escape", run: ()=>{ TAB_ESC = true; return false; }},
+          {key:"Tab", run: v => {
+             if(TAB_ESC){ TAB_ESC = false; return false; }
+             return CM.indentMore(v);        // 按 indentUnit 缩进,即 4 空格
+           },
+           shift: v => CM.indentLess(v)},
+          ...CM.defaultKeymap, ...CM.historyKeymap, ...CM.searchKeymap,
+        ]),
+        CM.syntaxHighlighting(HL),
+        MODES[lang] ? CM.StreamLanguage.define(MODES[lang]) : [],
+        /* 任何一次更新都清掉那个出口(和原来"按了别的键就清掉"一致);
+           文档变了才更新"未保存"标记 —— 只是移动光标不该标脏。 */
+        CM.EditorView.updateListener.of(u=>{
+          TAB_ESC = false;
+          if(u.docChanged) onEdit();
+        }),
+      ],
+    }),
+  });
+}
+
 let CUR = null;          // 当前题目 id
 let DATA = null;         // 当前题目详情
 let JOB = null;          // 正在轮询的任务
@@ -302,8 +432,8 @@ let TICK = null;         // 只管刷新"已用多少秒",不影响轮询
 let SAVED = null;            // 磁盘上那份的内容;null = 当前没有解答文件
 
 function isDirty(){
-  const ed = $("#ed");
-  return !!ed && SAVED !== null && ed.value !== SAVED;
+  const now = editorText();
+  return now !== null && SAVED !== null && now !== SAVED;
 }
 
 function toast(msg){
@@ -440,12 +570,6 @@ async function open(id){
 /* ---------- 解答 ---------- */
 function renderCode(){
   const has = !!DATA.solution_path;
-  // 重建面板前先记下编辑器当前高度。新建出来的 <pre> 是**空的**,拿它去量
-  // 会把高度塌成最小值 —— 那正是判题结束时「闪一下像只剩一部分」的来源:
-  // renderCode 重建 → 空 pre → 塌到 320px → 等高亮异步回来才恢复。
-  // 内容这时并没变,高度本来就不该变,直接把旧高度接过去。
-  const old = document.querySelector(".ed");
-  const prevH = old ? Math.round(old.getBoundingClientRect().height) : 0;
 
   $("#p-code").innerHTML = `
     <div class="bar">
@@ -457,11 +581,7 @@ function renderCode(){
       <span class="status" id="dirty" style="display:none;color:var(--warn)">● 未保存</span>
       <span class="status" id="prog" style="display:none"></span>
     </div>
-    ${has ? `<div class="ed">
-        <pre class="hl"><code id="edhl"></code></pre>
-        <textarea id="ed" spellcheck="false" autocomplete="off"
-                  autocapitalize="off" autocorrect="off"></textarea>
-      </div>` : ""}
+    ${has ? `<div class="cm-host" id="edhost"></div>` : ""}
     <pre class="out" id="jobout" style="display:none;margin-top:12px"></pre>`;
 
   const st = $("#b-start");
@@ -476,27 +596,14 @@ function renderCode(){
   const bb = $("#b-bench");
   if(bb) bb.onclick = ()=> run("bench");
 
-  const ed = $("#ed");
-  if(ed){
-    SAVED = DATA.solution;          // 盘上那份的基准
-    ed.value = DATA.solution;
-    if(prevH > 0){                  // 接住旧高度,别让它塌一下
-      const box = document.querySelector(".ed"), pre = box.querySelector("pre");
-      if(pre) pre.style.height = prevH + "px";
-      ed.style.height = prevH + "px";
-      box.style.height = prevH + "px";
-    }
-    ed.oninput = ()=>{ setPlain(); markDirty(); scheduleHighlight(); };
-    // 粘贴/撤销不一定触发 oninput,补一次
-    ed.addEventListener("paste", ()=> setTimeout(()=>{ setPlain(); scheduleHighlight(); }, 0));
-    // 离开编辑区就立刻高亮(不用等防抖)
-    ed.addEventListener("blur", ()=> highlightNow());
-    // 初始化:先按纯文本显示,随即高亮。
-    // ⚠️ 直接调函数,不要 dispatchEvent(new Event("input")) —— 那会让
-    //    oninput 跑一遍,以前就是它把"刚打开"误标成"改过了"。
-    setPlain();
-    fitEditor();
-    highlightNow();
+  const host = $("#edhost");
+  destroyEditor();                       // 上一道题的实例先扔掉,免得留着监听
+  if(host){
+    SAVED = DATA.solution;               // 盘上那份的基准
+    // 不等它 —— 编辑器包还没到时页面照样可用,挂好了自己会出现
+    mountEditor(host, DATA.solution, DATA.solution_lang)
+      .catch(e => console.warn("编辑器挂载失败:", e));
+    markSaved();
   }
 }
 
@@ -504,82 +611,14 @@ function renderCode(){
 function markDirty(){ const d=$("#dirty"); if(d) d.style.display = ""; }
 function markSaved(){ const d=$("#dirty"); if(d) d.style.display = "none"; }
 
-/* 切到"纯文本"态:textarea 显示自己的文字(原生渲染,零延迟),高亮层藏起来。
-   打字时用 —— 见 fitEditor 上面的说明。 */
-function setPlain(){
-  const box = document.querySelector(".ed");
-  if(box) box.classList.remove("hl-on");
-}
-
-/* 让编辑器长到刚好装下内容 —— 于是没有内层滚动,纵向交给页面。
-   量高度用的是 **<pre> 的 auto 高度**:它是绝对定位的块元素,`height:auto`
-   时自然按内容撑开,不会像"把 textarea 压到 20px 再量"那样动到编辑区 ——
-   后者会让 textarea 为了保持光标可见而内部滚动,回来就对不齐了。
-
-   ⚠️ 高度要设在 <pre> 上,不是它里面的 <code>(#edhl)。踩过两次:
-   可见的是 <pre>,把 height/scrollTop 设到 <code> 上毫无效果 ——
-   表现是「透明的 textarea 撑开了,可见的高亮层还卡在 320px,下半截一片空白」。 */
-function fitEditor(){
-  const box = document.querySelector(".ed");
-  if(!box) return;
-  const ed = $("#ed"), pre = box.querySelector("pre"), hl = $("#edhl");
-  if(!ed || !pre) return;
-  // ★ 面板隐藏时(display:none)后代什么都量不出来 — offsetHeight 恒为 0。
-  //   照量的话 max(320, 0) = 320,编辑器就塌成最小高度;切回解答页只剩前
-  //   十几行,非得编辑一下(触发高亮 → 面板已可见 → 重新量)才恢复。
-  if(!box.getClientRects().length) return;
-  // ★ 高亮还没落地时 <code> 是空的,量出来只有 padding —— 同样会把高度塌掉。
-  //   等 highlightNow 把内容填上自然会再量一次,这里不要抢着设。
-  if(hl && !hl.firstChild) return;
-  pre.style.height = "auto";                      // <pre> 按内容撑高
-  const h = Math.max(320, pre.offsetHeight);
-  pre.style.height = h + "px";
-  ed.style.height = h + "px";
-  box.style.height = h + "px";
-}
-
-/* ---- 实时高亮:防抖 + 过期响应丢弃 ----
-   走服务端(Pygments)而不是在前端塞一个高亮库,是为了和「参考解」页共用
-   同一套着色规则。实测单次 1~4ms,本地往返完全撑得住打字。 */
-let hlTimer = null, hlSeq = 0;
-
-function scheduleHighlight(){
-  clearTimeout(hlTimer);
-  hlTimer = setTimeout(highlightNow, 180);
-}
-
-async function highlightNow(){
-  const box = document.querySelector(".ed");
-  const ed = $("#ed"), hl = $("#edhl");
-  if(!box || !ed || !hl) return;
-  const seq = ++hlSeq;
-  const src = ed.value;
-
-  if(!DATA.solution_lang){                 // 语言认不出来,退回纯文本
-    hl.innerHTML = esc(src); box.classList.add("hl-on"); fitEditor(); return;
-  }
-  let html = null;
-  try{
-    const r = await fetch(API + "/api/highlight", {method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({source: src, lang: DATA.solution_lang})});
-    html = (await r.json()).html;
-  }catch(_){ /* 网断了就保持纯文本,别把编辑区搞空 */ }
-
-  if(seq !== hlSeq) return;                // 有更新的请求在路上,丢弃这次的
-  hl.innerHTML = (html != null) ? html : esc(src);
-  fitEditor();
-  box.classList.add("hl-on");              // 高亮好了才切过去
-}
-
 async function save(){
-  const ed = $("#ed");
-  if(!ed || SAVED === null) return {ok:false, error:"还没有解答文件"};
+  const src = editorText();
+  if(src === null || SAVED === null) return {ok:false, error:"还没有解答文件"};
   const r = await fetch(API + `/api/problems/${encodeURIComponent(CUR)}/solution`,
     {method:"PUT", headers:{"Content-Type":"application/json"},
-     body: JSON.stringify({source: ed.value})}).then(r=>r.json());
+     body: JSON.stringify({source: src})}).then(r=>r.json());
   if(r.error) return {ok:false, error:r.error};
-  SAVED = ed.value;                 // 记下盘上那份,isDirty 就是拿它比的
+  SAVED = src;                      // 记下盘上那份,isDirty 就是拿它比的
   markSaved();
   return {ok:true};
 }
@@ -767,9 +806,10 @@ function tab(name){
   for(const p of document.querySelectorAll(".pane"))
     p.classList.toggle("on", p.id === "p-" + name);
   if(location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
-  // 切回解答页时补量一次:隐藏期间 fitEditor 是跳过的(量不出东西),
-  // 高度可能还停在旧值或最小值上。
-  if(name === "code") fitEditor();
+  // 切回解答页要让编辑区重新量一次。CM6 自己监听尺寸变化,但它只测**容器**的
+  // 尺寸 —— 面板从 display:none 变回来时容器尺寸变了,得主动催一下,
+  // 否则光标位置和滚动范围会按隐藏期间的旧尺寸算。
+  if(name === "code" && VIEW) VIEW.requestMeasure();
 }
 for(const t of document.querySelectorAll(".tab"))
   t.onclick = ()=>{ flushChanges(); tab(t.dataset.p); };
@@ -780,6 +820,11 @@ for(const t of document.querySelectorAll(".tab"))
 window.addEventListener("beforeunload", e=>{ if(isDirty()) e.preventDefault(); });
 
 loadList().then(ps=>{
+  /* ★ 用户已经点过题了就别抢。loadList 是异步的,这段时间里完全可能已经有人
+     点了左边栏 —— 无条件 open() 会把他刚打开的那道题顶掉。
+     本地几十毫秒里几乎撞不上,但这是个真的竞态,而它一旦发生,
+     表现是"我点的题被换回去了",很难归因。 */
+  if(CUR) return;
   const done = ps.find(p=>p.started) || ps[0];
   if(done) open(done.id);
 });
