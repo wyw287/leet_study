@@ -84,6 +84,16 @@ SOLUTIONS_DIR: Optional[Path] = None
 BUILD_DIR: Optional[Path] = None
 PROGRESS: Optional[Path] = None
 
+#: 允许跨域访问的来源白名单。**默认为空 = 不开 CORS**(和以前一样)。
+#:
+#: 为什么是白名单而不是 `*`:这个 API 能改 `solutions/` 下的文件、能触发 `leet test`
+#: 去**编译并运行**那些文件 —— 开了通配,你浏览器里访问的任何一个网页都可以先
+#: 覆盖你的 solution.cu、再 POST 一个 test 把它跑起来。那就是一条 drive-by RCE。
+#: CORS 正是挡住这件事的那道墙,拆墙之前得知道墙后面是什么。
+#:
+#: 所以:要用就明确写出前端的来源(`http://localhost:3000` 之类)。
+_ALLOW_ORIGINS: List[str] = []
+
 
 def _require_root() -> Path:
     if ROOT is None:
@@ -338,11 +348,36 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "leet-webui/1.0"
 
     # ---- 工具 ---- #
+    def _cors_origin(self) -> Optional[str]:
+        """这个请求的来源允许吗?允许就返回该回的头值,否则 None。
+
+        只有**请求带了 Origin 且它在白名单里**才回 CORS 头 —— 同源请求和
+        命令行工具(curl)本来就不需要,回了反而是把口子开得比必要的大。
+        """
+        if not _ALLOW_ORIGINS:
+            return None
+        origin = self.headers.get("Origin")
+        if not origin:
+            return None
+        if "*" in _ALLOW_ORIGINS:
+            return "*"
+        return origin if origin in _ALLOW_ORIGINS else None
+
+    def _cors_headers(self) -> List[tuple]:
+        o = self._cors_origin()
+        if o is None:
+            return []
+        # Vary: Origin —— 同一个 URL 对不同来源会给出不同的头,
+        # 不声明的话中间缓存可能把给 A 站的响应喂给 B 站。
+        return [("Access-Control-Allow-Origin", o), ("Vary", "Origin")]
+
     def _send_json(self, obj: Any, code: int = 200) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for k, v in self._cors_headers():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -352,6 +387,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        for k, v in self._cors_headers():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -369,6 +406,25 @@ class Handler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     # ---- 路由 ---- #
+    def do_OPTIONS(self) -> None:                               # noqa: N802
+        """预检。
+
+        PUT + `Content-Type: application/json` 和 POST 都会先发一个 OPTIONS,
+        浏览器拿到不允许的答复就不发真正的请求。所以这里是跨域的实际闸门 ——
+        之前没有这个处理,一律 501,等于天然禁止跨域。
+        """
+        o = self._cors_origin()
+        if o is None:
+            return self._send_json({"error": "跨域未获允许"}, 403)
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", o)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "600")   # 600 秒内不用重复预检
+        self.send_header("Vary", "Origin")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self) -> None:                                  # noqa: N802
         path = self.path.split("?", 1)[0]
 
@@ -619,14 +675,15 @@ def _render_markdown(text: str) -> Optional[str]:
 
 
 def serve(root: Path, leet_bin: Path, host: str = "127.0.0.1", port: int = 8765,
-          open_browser: bool = False) -> None:
+          open_browser: bool = False, allow_origins: Optional[List[str]] = None) -> None:
     """起服务,阻塞直到 Ctrl-C。
 
     仓库根与 `leet` 可执行文件由调用方给(`leet web` 从框架拿,独立运行时自己找)——
     这样本模块不必知道框架怎么定位仓库。
     """
-    global JOBS
+    global JOBS, _ALLOW_ORIGINS
     _bind_root(root, leet_bin)
+    _ALLOW_ORIGINS = [o.strip() for o in (allow_origins or []) if o.strip()]
 
     if not PROBLEMS_DIR.is_dir():
         sys.exit(f"找不到题库目录 {PROBLEMS_DIR}")
@@ -638,6 +695,12 @@ def serve(root: Path, leet_bin: Path, host: str = "127.0.0.1", port: int = 8765,
     print(f"leet web  →  {url}")
     print(f"  仓库:{ROOT}")
     print(f"  CLI :{LEET}")
+    if _ALLOW_ORIGINS:
+        # 开了就一定要说清楚:这个 API 能改文件、还能编译并运行那些文件。
+        print(f"  跨域:{', '.join(_ALLOW_ORIGINS)}")
+        print("  [注意] 被允许的来源可以读写你的解答、并触发编译运行 ——"
+              "\n         等于把本机代码执行权交给了那些页面。"
+              "确认那是你自己的前端再继续。")
     print("  Ctrl-C 退出")
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
@@ -661,6 +724,9 @@ def main() -> None:
                     help="绑定地址。默认只绑本机 —— 这个工具会执行任意解答代码")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
+    ap.add_argument("--allow-origin", action="append", default=[],
+                    metavar="ORIGIN",
+                    help="允许跨域访问的来源(可重复)。默认不开 CORS")
     args = ap.parse_args()
 
     root = find_root()
@@ -671,7 +737,8 @@ def main() -> None:
     if leet is None:
         sys.exit(f"在 PATH 和 {root/'.venv/bin/leet'} 里都没找到 `leet`。"
                  "先装好:python3 -m venv .venv && .venv/bin/pip install -e .")
-    serve(root, leet, host=args.host, port=args.port, open_browser=args.open)
+    serve(root, leet, host=args.host, port=args.port, open_browser=args.open,
+          allow_origins=args.allow_origin)
 
 
 if __name__ == "__main__":

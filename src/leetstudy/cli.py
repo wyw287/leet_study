@@ -326,17 +326,25 @@ def clean(ctx: click.Context, yes: bool) -> None:
               help="绑定地址。默认只绑本机 —— 这个界面会执行任意解答代码,别暴露到网络")
 @click.option("--port", type=int, default=8765, help="端口")
 @click.option("--open", "open_browser", is_flag=True, help="启动后自动打开浏览器")
+@click.option("--allow-origin", multiple=True, metavar="ORIGIN",
+              help="允许跨域访问的来源(可重复,如 http://localhost:3000)。"
+                   "默认不开 CORS;要用就把前端地址明确写出来")
 @click.pass_context
-def web(ctx: click.Context, host: str, port: int, open_browser: bool) -> None:
+def web(ctx: click.Context, host: str, port: int, open_browser: bool,
+        allow_origin: tuple) -> None:
     """在浏览器里刷题(本地 web 界面)。
 
     比终端多的东西:题库侧栏、在线编辑解答(带语法高亮)、判题结果的表格视图、
     实时任务输出。数据来自题目目录里的文件,动作则交给 `leet` 命令本身 ——
     所以它和命令行看到的永远是同一份东西。
 
+    页面本身和 JSON 接口是分开的(前端是纯静态文件,数据全走 /api/*),
+    所以前端也能放到别处去跑 —— 那时用 --allow-origin 指明它的来源。
+
     \b
     例:leet web
         leet web --port 9000 --open
+        leet web --allow-origin http://localhost:3000
     """
     cfg = ctx.obj["cfg"]
     # 界面要调 `leet` 命令本身(不是 import 框架),所以得把它的位置传过去。
@@ -353,7 +361,7 @@ def web(ctx: click.Context, host: str, port: int, open_browser: bool) -> None:
     from .webui.server import serve
     try:
         serve(cfg.root, Path(leet_bin), host=host, port=port,
-              open_browser=open_browser)
+              open_browser=open_browser, allow_origins=list(allow_origin))
     except OSError as exc:
         console.print(f"[red]起不来:{exc}[/red]")
         console.print(f"[dim]端口 {port} 是不是被占了?换一个:leet web --port 9001[/dim]")

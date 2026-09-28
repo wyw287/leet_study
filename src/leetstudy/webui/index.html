@@ -273,6 +273,17 @@
 
 <script>
 "use strict";
+/* API 基地址。默认空串 = **同源**(`leet web` 自己吐页面时就是这种用法)。
+   想把前端放到别处跑(比如 localhost:3000 的静态服务器),两种办法指定:
+     · URL 上加 ?api=http://127.0.0.1:8765
+     · 或在页面里先设 window.LEET_API = "http://127.0.0.1:8765"
+   不指定的话所有请求都会打到前端自己的源上,那个源没有 API。
+   (顺带:跨域还得在后端开 `leet web --allow-origin <前端来源>`。)
+   注意:这段注释里不能出现字面的 script 结束标签 —— HTML 解析器不看
+   JS 注释,遇到它就当脚本结束,后面的代码全变成页面文本。 */
+const API = ((new URLSearchParams(location.search).get("api") || window.LEET_API || "")
+             .replace(/\/+$/, ""));
+
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -358,7 +369,7 @@ function wrapTables(root){
 
 /* ---------- 侧栏 ---------- */
 async function loadList(){
-  const r = await fetch("/api/problems").then(r=>r.json());
+  const r = await fetch(API + "/api/problems").then(r=>r.json());
   const ps = r.problems || [];
   $("#qn").textContent = ps.filter(p=>p.solved).length + "/" + ps.length;
 
@@ -387,7 +398,7 @@ async function open(id){
   // 切走时**自动保存**,不再弹确认框打断人。存不下去才拦。
   if(!await flushChanges()) return;
   CUR = id;
-  DATA = await fetch("/api/problems/"+encodeURIComponent(id)).then(r=>r.json());
+  DATA = await fetch(API + "/api/problems/"+encodeURIComponent(id)).then(r=>r.json());
   for(const b of document.querySelectorAll(".item"))
     b.classList.toggle("on", b.dataset.id === id);
 
@@ -549,7 +560,7 @@ async function highlightNow(){
   }
   let html = null;
   try{
-    const r = await fetch("/api/highlight", {method:"POST",
+    const r = await fetch(API + "/api/highlight", {method:"POST",
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({source: src, lang: DATA.solution_lang})});
     html = (await r.json()).html;
@@ -564,7 +575,7 @@ async function highlightNow(){
 async function save(){
   const ed = $("#ed");
   if(!ed || SAVED === null) return {ok:false, error:"还没有解答文件"};
-  const r = await fetch(`/api/problems/${encodeURIComponent(CUR)}/solution`,
+  const r = await fetch(API + `/api/problems/${encodeURIComponent(CUR)}/solution`,
     {method:"PUT", headers:{"Content-Type":"application/json"},
      body: JSON.stringify({source: ed.value})}).then(r=>r.json());
   if(r.error) return {ok:false, error:r.error};
@@ -586,7 +597,7 @@ async function run(action){
   if(action==="test" || action==="bench"){
     if(!await flushChanges()) return;     // 跑之前先把改动落盘,判的才是当前代码
   }
-  const r = await fetch(`/api/problems/${encodeURIComponent(CUR)}/${action}`,
+  const r = await fetch(API + `/api/problems/${encodeURIComponent(CUR)}/${action}`,
     {method:"POST"}).then(r=>r.json());
   if(r.error) return toast(r.error);
   JOB = r.job.id;
@@ -646,7 +657,7 @@ function stopTick(){
 
 async function poll(){
   if(!JOB) return;
-  const r = await fetch("/api/jobs/"+JOB).then(r=>r.json());
+  const r = await fetch(API + "/api/jobs/"+JOB).then(r=>r.json());
   if(r.error){ JOB=null; stopTick(); setBusy(false); return toast(r.error); }
   const out = $("#jobout");
   if(out) out.textContent = r.output || "(没有输出)";
@@ -662,7 +673,7 @@ async function poll(){
   } else {
     toast(`完成 · 用时 ${secs}s`);
     // 重新拉题目详情:解答可能刚由 start 生成,判题结果也刷新了
-    DATA = await fetch("/api/problems/"+encodeURIComponent(CUR)).then(r=>r.json());
+    DATA = await fetch(API + "/api/problems/"+encodeURIComponent(CUR)).then(r=>r.json());
     renderResult(DATA.verdict);
     renderCode();
     await loadList();
