@@ -100,6 +100,7 @@
      要求两层 font/line-height/padding/tab-size **逐项对齐**,还得靠 fitEditor()
      按内容撑高、靠 syncScroll 同步滚动位置 —— 那些全是因为"没有真正的编辑控件"
      才存在的。有 CM6 之后整块作废。 */
+  /* ---- 编辑器外壳(这部分是页面自己的 DOM,不是 CM6 画的)---- */
   .cm-host{border:1px solid var(--line);border-radius:9px;overflow:hidden;
     background:var(--code-bg);margin-bottom:14px}
   /* 退化路径:vendor/codemirror.js 加载失败时用的纯文本编辑框 */
@@ -107,22 +108,17 @@
     border:0;background:var(--code-bg);color:var(--fg);resize:vertical;tab-size:4;
     outline:none;
     font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-  .cm-editor{color:var(--py-base,inherit);
-    font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-  .cm-editor.cm-focused{outline:none}
-  .cm-scroller{font-family:inherit;overflow:auto;height:min(62vh,720px)}
-  .cm-content{padding:12px 0}
-  .cm-line{padding:0 12px}
-  .cm-gutters{background:var(--code-bg);border:none;border-right:1px solid var(--line);
-    color:var(--dim)}
-  .cm-activeLine{background:transparent}
-  .cm-activeLineGutter{background:transparent;color:var(--fg)}
-  .cm-cursor{border-left-color:var(--fg)}
-  .cm-panels{background:var(--panel);color:var(--fg);border-color:var(--line)}
-  .cm-panels input,.cm-panels button{font:inherit;padding:3px 8px;border-radius:5px;
-    border:1px solid var(--line);background:var(--panel);color:var(--fg)}
-  .cm-searchMatch{background:rgba(255,196,0,.35)}
-  .cm-searchMatch.cm-searchMatch-selected{background:rgba(255,140,0,.5)}
+
+  /* ★ 编辑器内部的样式**不在这个文件里**,见 JS 里的 CM_THEME。
+     踩过的坑:在这里写 `.cm-gutters{...}` 之类的规则是**不生效**的 ——
+     CM6 会在运行时往 <head> 注入自己的基础主题,而它排在这个 <style> 之后,
+     同优先级下它赢;更麻烦的是它的规则带 `&light` / `&dark` 前缀(等于多一个
+     类选择器),优先级本来就比单类高一级。
+     症状很隐蔽:深色主题下行号栏是 CM6 浅色主题的 #f5f5f5、当前行泛一层浅蓝,
+     整块编辑器"半深半浅",看着像配色没调好 —— 其实是我们的规则压根没进去。
+     正确做法是用 CM6 自己的 EditorView.theme(),它参与同一套优先级体系,
+     排在基础主题之后,稳定覆盖。 */
+
 
   /* 输出 */
   pre.out{background:var(--code-bg);border:1px solid var(--line);border-radius:9px;
@@ -302,10 +298,73 @@ $("#hlcss").href = API + "/api/highlight.css";
    才开始拉题库,而这两件事毫无关系。
 
    加载失败不致命:退化成纯文本 textarea。写代码总得有地方写。 */
-let CM = null, HL = null, MODES = {};
+let CM = null, HL = null, MODES = {}, CM_THEME = null;
 const CM_READY = import(API + "/vendor/codemirror.js").then(m => {
   CM = m;
   MODES = {cuda: m.cuda, cpp: m.cpp, python: m.python};
+
+  /* 编辑器**内部**的样式(行号栏、当前行、下拉……)走 CM6 自己的主题 API,
+     不写在页面的 <style> 里。理由见 CSS 里那段注释:写在页面里会被 CM6
+     运行时注入的基础主题压掉,而且它的规则带 `&light`/`&dark` 前缀,优先级
+     天然高一级。theme() 参与同一套优先级体系,排在基础主题之后,稳定覆盖。
+
+     颜色仍然全部取自 --py-* / 页面变量,所以深浅色是跟着 CSS 走的,
+     这里不需要写两套。 */
+  CM_THEME = m.EditorView.theme({
+    "&": {color: "var(--py-base, inherit)",
+          font: "13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"},
+    "&.cm-focused": {outline: "none"},
+    ".cm-scroller": {fontFamily: "inherit", overflow: "auto",
+                     height: "min(62vh, 720px)"},
+    ".cm-content": {padding: "12px 0"},
+    ".cm-line": {padding: "0 12px"},
+    /* 行号栏。baseTheme 里是 &light/#f5f5f5 与 &dark/#333,不覆盖的话
+       深色主题下这是一条刺眼的浅灰边。 */
+    ".cm-gutters": {backgroundColor: "var(--code-bg)", border: "none",
+                    borderRight: "1px solid var(--line)", color: "var(--dim)"},
+    ".cm-activeLine": {backgroundColor: "transparent"},
+    ".cm-activeLineGutter": {backgroundColor: "transparent", color: "var(--fg)"},
+    ".cm-cursor": {borderLeftColor: "var(--fg)"},
+    ".cm-panels": {backgroundColor: "var(--panel)", color: "var(--fg)",
+                   borderColor: "var(--line)"},
+    ".cm-panels input, .cm-panels button": {
+      font: "inherit", padding: "3px 8px", borderRadius: "5px",
+      border: "1px solid var(--line)", backgroundColor: "var(--panel)",
+      color: "var(--fg)"},
+    ".cm-searchMatch": {backgroundColor: "rgba(255,196,0,.35)"},
+    ".cm-searchMatch.cm-searchMatch-selected": {backgroundColor: "rgba(255,140,0,.5)"},
+    /* 补全下拉。CM6 默认是浅色的一套,暗色主题下选中项会变成蓝底 ——
+       连同"白底白字"那个问题都出在这里没覆盖上。 */
+    ".cm-tooltip": {backgroundColor: "var(--panel)", border: "1px solid var(--line)",
+                    borderRadius: "8px", boxShadow: "var(--shadow)"},
+    ".cm-tooltip-autocomplete > ul": {
+      font: "13px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
+      maxHeight: "240px"},
+    ".cm-tooltip-autocomplete > ul > li": {
+      padding: "2px 10px", display: "flex", gap: "8px", alignItems: "baseline"},
+    ".cm-tooltip-autocomplete ul li[aria-selected]": {
+      backgroundColor: "var(--accent)", color: "#fff"},
+    /* 右侧那条说明(「块内/设备同步」「运行时 API」)推到最右 —— 不然名字长短
+       不一时说明会参差不齐,扫起来很累。 */
+    ".cm-completionDetail": {fontStyle: "normal", fontSize: "11.5px",
+                             color: "var(--dim)", marginLeft: "auto",
+                             paddingLeft: "12px"},
+    ".cm-tooltip-autocomplete ul li[aria-selected] .cm-completionDetail":
+      {color: "#dbeafe"},
+    ".cm-completionIcon": {width: "1em", opacity: ".6"},
+    ".cm-completionIcon-type:after": {content: "'𝑡'"},
+    ".cm-completionIcon-variable:after": {content: "'𝑥'"},
+    ".cm-completionIcon-function:after": {content: "'ƒ'"},
+    ".cm-completionIcon-keyword:after": {content: "'𝑘'"},
+  });
+
+  THEME_MODE = new m.Compartment();
+  // 系统切换深浅色时重配,不用重建编辑器(内容、光标、撤销栈都保留)
+  DARK_MQ.addEventListener("change", () => {
+    if (!VIEW || !CM) return;
+    VIEW.dispatch({effects: THEME_MODE.reconfigure(
+      CM.EditorView.darkTheme.of(DARK_MQ.matches))});
+  });
 
   /* 配色**没有一个是硬编码的**,全部绑到 --py-* 变量。那些变量由服务端的
      /api/highlight.css 从 Pygments 自己生成的 CSS 里反解出来(见 server.py 的
@@ -343,6 +402,13 @@ let VIEW = null;         // CodeMirror 实例(加载成功时)
 let PLAIN = null;        // 退化路径用的 textarea
 let TAB_ESC = false;     // 按过 Esc 之后的那次 Tab 放行给浏览器
 let ED_GEN = 0;          // 编辑器代次 —— 用来作废"还没挂完就被换掉"的那次挂载
+
+/* 深浅色。**必须显式告诉 CM6**,它不会自己看 prefers-color-scheme:
+   不说的话它按浅色走,基础主题里那些 `&light` 规则就会生效 ——
+   行号栏变 #f5f5f5、当前行泛浅蓝、选中背景是浅紫,在暗色页面上非常刺眼。
+   (我们自己覆盖了大部分,但没必要跟它对着干。) */
+const DARK_MQ = matchMedia("(prefers-color-scheme: dark)");
+let THEME_MODE = null;   // Compartment:切换深浅色时重配,不用重建编辑器
 
 const UNIT = "    ";     // 4 空格 —— 仓库里的解答/模板/参考解统一用空格,没有 Tab
 
@@ -393,6 +459,8 @@ async function mountEditor(host, src, lang){
         CM.drawSelection(), CM.bracketMatching(), CM.history(),
         CM.highlightSelectionMatches(),
         CM.indentUnit.of(UNIT),
+        CM_THEME,
+        THEME_MODE.of(CM.EditorView.darkTheme.of(DARK_MQ.matches)),
         CM.keymap.of([
           /* Esc 之后的那次 Tab 放行给浏览器 —— 否则纯键盘用户会被困在编辑区里
              出不来(defaultKeymap 故意不绑 Tab,也是这个理由)。返回 false 时
@@ -404,9 +472,40 @@ async function mountEditor(host, src, lang){
            },
            shift: v => CM.indentLess(v)},
           ...CM.defaultKeymap, ...CM.historyKeymap, ...CM.searchKeymap,
+          ...CM.completionKeymap,        // Ctrl-Space 手动触发 + 上下键选择
+          ...CM.closeBracketsKeymap,     // 退格一次删掉成对的括号
         ]),
         CM.syntaxHighlighting(HL),
         MODES[lang] ? CM.StreamLanguage.define(MODES[lang]) : [],
+
+        /* ---- 补全 ----
+           两路来源,**并列而不是替换**:
+
+           ① 语言关键字 —— 挂在模式的 languageData 里(clike 与 python 模式
+              本来就带一份,我们的 CUDA 模式又追加了一份 CUDA 词表,见
+              vendor/src/cuda-mode.js)。三个科目自动各用各的,不用在这里分。
+
+           ② 文档里已经出现过的标识符 —— CM6 自带的 completeAnyWord。
+
+           ⚠️ 这里**不能**用 autocompletion({override:[...]})。override 会
+           **替换**掉所有 languageData 来源,等于把 ① 整个挤掉,只剩你自己列的
+           那几个源。正确做法是像下面这样,把 ② 也作为一条 languageData 挂进去
+           —— CM6 的 languageDataAt 会**收集全部** provider,两路并存。
+
+           ⚠️ ② 是词形匹配、不是语义补全:能补出你写过的 ctx / block / n,
+           但**不认识类型**,`ctx.` 之后不会列出结构体成员。
+           两路之间也**不去重**(打 blo 时 blockDim 会出现两次)—— 这是明确
+           接受的行为,理由写在 vendor/src/cuda-mode.js 末尾。 */
+        CM.EditorState.languageData.of(() => [{autocomplete: CM.completeAnyWord}]),
+        CM.autocompletion(),
+
+        /* 打 `(` 自动补 `)`,光标停在中间。括号表**不用我们写** —— clike
+           (cuda 继承它)和 python 两个模式各自在 languageData 里声明了:
+           圆括号 / 方括号 / 花括号 / 单引号 / 双引号(python 还多三引号),
+           CM6 自己会读。
+
+           注意 `<` **不在**表里,所以 CUDA 的 `<<<grid, block>>>` 不受影响。 */
+        CM.closeBrackets(),
         /* 任何一次更新都清掉那个出口(和原来"按了别的键就清掉"一致);
            文档变了才更新"未保存"标记 —— 只是移动光标不该标脏。 */
         CM.EditorView.updateListener.of(u=>{

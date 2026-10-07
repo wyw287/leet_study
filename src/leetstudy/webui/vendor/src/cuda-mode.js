@@ -9,10 +9,23 @@
 // 映射成 Tag。可用的名字见 @codemirror/language 的 defaultTokenTable。
 import { cpp } from "@codemirror/legacy-modes/mode/clike"
 
-// 归为 typeName(红)—— 与 Pygments 的 Token.Keyword.Type 对齐。
-// 注意存储/访问限定符也在这里:Pygments 的 CudaLexer 就是这么分的
-// (__shared__ / __restrict__ 是 kt,而 __global__ 是 kr)。
-const CUDA_TYPES = `
+// ---------------------------------------------------------------------------
+// 词表
+//
+// **一份数据,两处用途**:编辑器上色(token() 按 kind 定样式名),补全下拉
+// (按 kind 给图标、按组的说明给 detail)。合成一张表是为了两边不漂移 ——
+// 加一个词只需要加一行。
+//
+// kind 只有三类,因为样式名只有三类可映射:
+//   type    → "typeName"  (红)   Pygments 的 Token.Keyword.Type
+//   builtin → "builtin"   (绿)   Pygments 的 Name.Builtin(nb)
+//   kw      → "keyword"   (绿)   Pygments 的 k / kr
+//
+// 分组只影响补全下拉里的 detail,不影响上色 —— 所以可以按语义随便分。
+// ---------------------------------------------------------------------------
+
+// ---- 类型(红)----
+const T = `
   float2 float3 float4 double2 double3 double4 half2 half4
   char2 char4 uchar2 uchar4 short2 short4 ushort2 ushort4
   int2 int3 int4 uint2 uint3 uint4 long2 long4 ulong2 ulong4
@@ -22,40 +35,92 @@ const CUDA_TYPES = `
   cudaTextureObject_t cudaSurfaceObject_t
 `
 
-// 归为 builtin(绿,Pygments 的 nb)—— 这五个是「内核自带的变量」,
-// 单独一类是因为 monokai 暗色主题下 nb(#A6E22E)和 k(#66D9EF)不是同一个颜色,
-// 合进 keyword 会在暗色下露馅。
-const CUDA_BUILTINS = `threadIdx blockIdx blockDim gridDim warpSize`
+// ---- 内建变量(绿,nb)—— 单独一类是因为 monokai 暗色下 nb(#A6E22E)和
+//      k(#66D9EF)不是一个颜色,合进 keyword 会在暗色主题露馅。
+const BUILTIN = `threadIdx blockIdx blockDim gridDim warpSize`
 
-// 归为 keyword(绿)—— 与 Pygments 的 k / kr 对齐(默认配色里这俩都是绿色粗体)。
-// 这一类比 Pygments 的 CUDA lexer 覆盖得广:Pygments 只认 __global__/__forceinline__
-// 等少数几个,把 atomicAdd / cudaMalloc / __syncwarp 都当成普通名字(不着色)。
-// 这里补齐 —— 同样是绿,只是让 CUDA 自己的东西都亮起来。
-const CUDA_KEYWORDS = `
-  __global__ __device__ __host__ __forceinline__ __noinline__ __inline__
-  __launch_bounds__ __grid_constant__
-  __syncthreads __syncthreads_count __syncthreads_and __syncthreads_or
-  __syncwarp __threadfence __threadfence_block __threadfence_system
-  __shfl_sync __shfl_up_sync __shfl_down_sync __shfl_xor_sync
-  __shfl __shfl_up __shfl_down __shfl_xor
-  __ballot_sync __all_sync __any_sync __activemask __match_any_sync
-  __popc __popcll __ffs __ffsll __clz __clzll __brev __brevll
-  __mul24 __umul24 __mulhi __umulhi __sad __usad
-  __ldg __ldcv __ldca __stcg __stcs
-  __expf __exp10f __logf __log2f __powf __sinf __cosf __sincosf __tanf
-  __fdividef __frcp_rn __fsqrt_rn __saturatef fmaf
-  atomicAdd atomicSub atomicExch atomicMin atomicMax atomicInc atomicDec
-  atomicCAS atomicAnd atomicOr atomicXor
-  cudaMalloc cudaMallocManaged cudaFree cudaMemcpy cudaMemcpyAsync cudaMemset
-  cudaDeviceSynchronize cudaGetLastError cudaPeekAtLastError cudaGetErrorString
-  cudaStreamCreate cudaStreamDestroy cudaStreamSynchronize
-  cudaEventCreate cudaEventRecord cudaEventElapsedTime cudaEventSynchronize
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor
-`
+// ---- 关键字:按语义分组,补全时用组名当说明 ----
+const GROUPS = [
+  ["限定符", `
+    __global__ __device__ __host__ __forceinline__ __noinline__ __inline__
+    __launch_bounds__ __grid_constant__
+  `],
+  ["块内/设备同步", `
+    __syncthreads __syncthreads_count __syncthreads_and __syncthreads_or
+    __syncwarp __threadfence __threadfence_block __threadfence_system
+  `],
+  ["warp 交换/投票", `
+    __shfl_sync __shfl_up_sync __shfl_down_sync __shfl_xor_sync
+    __shfl __shfl_up __shfl_down __shfl_xor
+    __ballot_sync __all_sync __any_sync __activemask __match_any_sync
+  `],
+  ["原子操作", `
+    atomicAdd atomicSub atomicExch atomicMin atomicMax atomicInc atomicDec
+    atomicCAS atomicAnd atomicOr atomicXor
+  `],
+  ["位运算", `__popc __popcll __ffs __ffsll __clz __clzll __brev __brevll
+              __mul24 __umul24 __mulhi __umulhi __sad __usad`],
+  ["快速数学", `
+    __expf __exp10f __logf __log2f __powf __sinf __cosf __sincosf __tanf
+    __fdividef __frcp_rn __fsqrt_rn __saturatef fmaf
+  `],
+  ["缓存/访存提示", `__ldg __ldcv __ldca __stcg __stcs`],
+  ["运行时 API", `
+    cudaMalloc cudaMallocManaged cudaFree cudaMemcpy cudaMemcpyAsync cudaMemset
+    cudaDeviceSynchronize cudaGetLastError cudaPeekAtLastError cudaGetErrorString
+    cudaStreamCreate cudaStreamDestroy cudaStreamSynchronize
+    cudaEventCreate cudaEventRecord cudaEventElapsedTime cudaEventSynchronize
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor
+  `],
+]
 
-const TYPES = new Set(CUDA_TYPES.trim().split(/\s+/))
-const BUILTINS = new Set(CUDA_BUILTINS.trim().split(/\s+/))
-const KEYWORDS = new Set(CUDA_KEYWORDS.trim().split(/\s+/))
+const split = s => s.trim().split(/\s+/)
+const TYPES = new Set(split(T))
+const BUILTINS = new Set(split(BUILTIN))
+
+// 词 → 说明(组名)。同一个词出现在多组时以**先出现的**为准。
+const DETAIL = new Map()
+for (const [group, words] of GROUPS)
+  for (const w of split(words))
+    if (!DETAIL.has(w)) DETAIL.set(w, group)
+const KEYWORDS = new Set(DETAIL.keys())
+
+// token() 的返回值:legacy 样式名。只有这三类。
+const STYLE = {type: "typeName", builtin: "builtin", kw: "keyword"}
+
+// ---------------------------------------------------------------------------
+// 补全
+//
+// 两类来源,CM6 的 `autocompletion()` 会把它们合起来(见文件末尾的
+// languageData —— 它和 clike 自带的 C++ 关键字表**并列**,不是替换):
+//
+//   ① 这张词表 + clike 的 C++ 关键字  → 静态,`completeFromList`
+//   ② 文档里已经出现过的标识符         → `completeAnyWord`(前端挂,见 index.html)
+//
+// 注意 ② 是**词形匹配**,不是语义补全:它能把 `ctx`、`n`、`block` 这些你已经
+// 写过的名字补出来,但**不认识类型** —— 所以 `ctx.` 之后不会列出结构体成员。
+// 那需要真正的语义分析(知道 ctx 是 LaunchCtx),CM6 的流式分词器做不到。
+//
+// ⚠️ **两路之间不去重,这是已知且接受的行为。**
+// 打 `blo` 时 `blockDim` 会出现两次:一次来自这张表(带「内建变量」说明),
+// 一次来自 completeAnyWord(文档里出现过 `blockDim.x`,没说明)。
+// 想过三个办法,选了最省事的:
+//   · 自己扫文档、合并成一路    —— 能去重,但要多写 20 行,还得自己维护
+//   · 把内建从这张表里删掉      —— 新文件(还没写过 threadIdx)就补不出来了
+//   · 接受重复                  ← 现在的选择
+// 重复项的说明文字不一样,看起来更像"两个来源"而不是"坏了"。真要治的话,
+// 上面第一条是正路。
+// ---------------------------------------------------------------------------
+
+// clike 自带的 C++ 关键字/类型/字面量,拍平成一个字符串数组。
+const CPP_WORDS = cpp.languageData.autocomplete || []
+
+const COMPLETIONS = [
+  ...[...TYPES].map(label => ({label, type: "type", detail: "CUDA 类型"})),
+  ...[...BUILTINS].map(label => ({label, type: "variable", detail: "内建变量"})),
+  ...[...KEYWORDS].map(label => ({label, type: "function", detail: DETAIL.get(label)})),
+  ...CPP_WORDS.map(label => ({label, type: "keyword"})),
+]
 
 export const cuda = {
   name: "cuda",
@@ -65,7 +130,10 @@ export const cuda = {
   startState: cpp.startState,
   copyState: cpp.copyState,
   indent: cpp.indent,
-  languageData: cpp.languageData,
+
+  // autocomplete 这一项**追加**在 clike 的后面:两边的值都会被
+  // languageDataAt 收集,再各自 asSource() 成一路补全来源。
+  languageData: {...cpp.languageData, autocomplete: COMPLETIONS},
 
   token(stream, state) {
     // state.tokenize 非空 = 正处在注释/字符串/预处理指令里,
@@ -75,9 +143,9 @@ export const cuda = {
       stream.eatWhile(/[\w$]/)
       const word = stream.current()
       if (word) {
-        if (TYPES.has(word)) return "typeName"
-        if (BUILTINS.has(word)) return "builtin"
-        if (KEYWORDS.has(word)) return "keyword"
+        if (TYPES.has(word)) return STYLE.type
+        if (BUILTINS.has(word)) return STYLE.builtin
+        if (KEYWORDS.has(word)) return STYLE.kw
       }
       stream.pos = save // 没命中就完全交还给 clike,不留痕迹
     }

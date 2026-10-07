@@ -344,6 +344,23 @@ JOBS: Optional[JobQueue] = None
 # HTTP
 # --------------------------------------------------------------------------- #
 
+class _Server(ThreadingHTTPServer):
+    """服务器本体。两个属性都**必须在这里**设,不能构造完再赋值:
+
+    · `request_queue_size` 只在 `server_bind()` 里被读一次去调 `listen()`,
+      所以构造之后再改已经晚了(`socketserver` 的默认值是 5)。
+    · 两者都是**服务器类**的属性 —— 写在 Handler 上完全不生效。这个坑我踩过:
+      改完一看 `ss -ltn` 的 backlog 还是 5。
+
+    backlog 5 对于"浏览器一次并发开 4~6 条连接 + 外面还套一层转发"是偏小的,
+    表现是连接被内核丢掉、客户端一直转圈、而**服务端日志里什么都没有**。
+    """
+
+    request_queue_size = 128
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "leet-webui/1.0"
 
@@ -382,11 +399,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_text(self, text: str, code: int = 200,
-                   ctype: str = "text/plain; charset=utf-8") -> None:
+                   ctype: str = "text/plain; charset=utf-8",
+                   no_store: bool = False) -> None:
         body = text.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        if no_store:
+            self.send_header("Cache-Control", "no-store")
         for k, v in self._cors_headers():
             self.send_header(k, v)
         self.end_headers()
@@ -401,9 +421,24 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
 
+    # ★ 默认是 HTTP/1.0,每响应一个请求就关连接。浏览器打开一个页面会并发发
+    # 4~6 条请求,于是每次都得重新握手 —— 在共享服务器 + SSH 转发这种链路上
+    # 很容易撞上 accept 队列。改 1.1 后连接会被复用。
+    #
+    # 开 1.1 的前提是**每条响应都必须带准确的 Content-Length**(否则客户端会
+    # 一直等连接关,表现就是"转圈、空白")。下面三个发送路径都带了,加新的
+    # 响应路径时别忘了。
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt: str, *args: Any) -> None:      # 安静一点
-        if os.environ.get("LEET_WEBUI_VERBOSE"):
-            super().log_message(fmt, *args)
+        if not os.environ.get("LEET_WEBUI_VERBOSE"):
+            return
+        # 带上 User-Agent —— 默认格式只有 IP,而这是一台**共享服务器**,
+        # 光看 127.0.0.1 分不出请求是你自己发的还是别人的进程。
+        # (实测踩过:服务端日志里一直有 /api/problems 在轮询,查了半天才发现
+        #  来源是个已经跑了两周的、属于另一个用户的 Firefox。)
+        super().log_message(fmt + '  UA="%s"', *args,
+                            self.headers.get("User-Agent", "-"))
 
     # ---- 路由 ---- #
     def do_OPTIONS(self) -> None:                               # noqa: N802
@@ -428,9 +463,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:                                  # noqa: N802
         path = self.path.split("?", 1)[0]
 
+        # ★ no-store:这个服务**一个缓存头都不发**的话,浏览器会启发式缓存,
+        # 而这两样东西每次改代码都会变(index.html 和 392 KB 的编辑器产物)。
+        # 实测踩过:换了编辑器包之后浏览器还在用旧的,新页面调一个旧包里没有的
+        # 导出 —— 页面挂掉,而服务端日志里一切正常,极难归因。
+        # 本地端口上重新下载 392 KB 是毫秒级,不值得为它冒这个险。
         if path in ("/", "/index.html"):
             html = (HERE / "index.html").read_text(encoding="utf-8")
-            return self._send_text(html, ctype="text/html; charset=utf-8")
+            return self._send_text(html, ctype="text/html; charset=utf-8",
+                                   no_store=True)
 
         # 前端编辑器(CodeMirror 6)的打包产物。**提交进仓库**,不是运行时生成的 ——
         # 重装/升级的办法见 vendor/BUILD.md。缺了它页面还能用,只是编辑区退化成
@@ -441,14 +482,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(
                     {"error": "前端编辑器产物缺失 —— 见 webui/vendor/BUILD.md"}, 404)
             return self._send_text(f.read_text(encoding="utf-8"),
-                                   ctype="text/javascript; charset=utf-8")
+                                   ctype="text/javascript; charset=utf-8",
+                                   no_store=True)
 
         if path == "/api/problems":
             return self._send_json({"problems": _list_problems(),
                                     "queue": JOBS.snapshot() if JOBS else {}})
 
         if path == "/api/highlight.css":
-            return self._send_text(_highlight_css(), ctype="text/css; charset=utf-8")
+            return self._send_text(_highlight_css(), ctype="text/css; charset=utf-8",
+                                   no_store=True)
 
         m = re.fullmatch(r"/api/problems/([^/]+)", path)
         if m:
@@ -617,12 +660,34 @@ def _highlight_css() -> str:
     except ImportError:
         return ""
     light = HtmlFormatter(style="default").get_style_defs(".hl")
-    dark = HtmlFormatter(style="monokai").get_style_defs(".hl")
+    # 深色用 dracula 而不是 monokai —— 实测 monokai 的 k(关键字)和 kt(类型)
+    # 是**同一个颜色** #66D9EF,于是 `__global__` 和 `void` 长得一模一样。
+    # 这两个恰恰是 CUDA 里最常并排出现的两类 token。
+    # 备选里一个都不完美(见 docs/webui.md 的对照表),dracula 是撞得最轻的:
+    # 它让 k 与 kt 分开了(粉 / 青),代价是 kt 与 nb 同色(青),
+    # 而 nb(threadIdx 这类)出现得远比 kt 少。
+    dark = HtmlFormatter(style="dracula").get_style_defs(".hl")
     return (light
             + "\n:root{" + _theme_vars(light) + "}"
             + "\n@media (prefers-color-scheme: dark) {\n"
             + dark
-            + "\n:root{" + _theme_vars(dark) + "}\n}")
+            + _override_rules(".hl", _DARK_OVERRIDES)
+            + "\n:root{" + _theme_vars(dark, _DARK_OVERRIDES) + "}\n}")
+
+
+def _override_rules(scope: str, overrides: Dict[str, str]) -> str:
+    """把改开的颜色**也**写进 Pygments 那套类名里。
+
+    只导 --py-* 是不够的:「参考解」页和题面里的代码块是**服务端渲染好的
+    HTML**,用的是 Pygments 原样输出的 `.hl .nb` 这类类名,它们不读变量。
+    不补这几条,编辑器里 threadIdx 是绿的面参考解页还是青的 ——
+    那正是这套设计要避免的「三处不一致」。
+
+    放在 `dark` 之后(同级选择器、后来者胜),所以能盖掉 Pygments 的原值。
+    """
+    by_var = dict(_CSS_VARS)
+    return "".join("\n%s .%s{color:%s}" % (scope, by_var[v], c)
+                   for v, c in overrides.items())
 
 
 # --------------------------------------------------------------------------- #
@@ -667,7 +732,7 @@ def _css_color(css: str, cls: str) -> str:
 def _css_base(css: str) -> str:
     """Pygments 在 `.hl` 上设的**基准正文色**。
 
-    default 主题不设(于是继承页面色),monokai 会设成 #f8f8f2。编辑器如果不
+    default 主题不设(于是继承页面色),dracula 会设成 #f8f8f2。编辑器如果不
     跟着设,暗色下整屏代码会比参考解页暗一档(230 vs 248),看着像失焦。
     """
     m = re.search(r"^\.hl \{([^}]*)\}", css, re.M)
@@ -678,15 +743,42 @@ def _css_base(css: str) -> str:
     return "inherit"
 
 
-def _theme_vars(css: str) -> str:
-    """从一份 Pygments CSS 里导出编辑器要用的全部 --py-* 变量。"""
+def _theme_vars(css: str, overrides: Optional[Dict[str, str]] = None) -> str:
+    """从一份 Pygments CSS 里导出编辑器要用的全部 --py-* 变量。
+
+    `overrides` 用来改开主题自身的撞色,键是 `_CSS_VARS` 里的短名。
+    这不破坏「颜色只定义一次」——覆盖发生在这里,而 --py-* 正是编辑器、题面、
+    参考解页**共用**的那一份,所以三处依然一致。它破的只是「必须原样照抄
+    Pygments 主题」,而那本身不是目的。
+    """
+    overrides = overrides or {}
     out = ["--py-base:%s;" % _css_base(css)]
     for var, cls in _CSS_VARS:
         rule = _css_rule(css, cls)
-        out.append("--py-%s:%s;" % (var, _css_color(css, cls)))
+        color = overrides.get(var) or _css_color(css, cls)
+        out.append("--py-%s:%s;" % (var, color))
         out.append("--py-%s-w:%s;" % (var, "bold" if "font-weight: bold" in rule else "normal"))
         out.append("--py-%s-s:%s;" % (var, "italic" if "font-style: italic" in rule else "normal"))
     return "".join(out)
+
+
+# 深色主题(dracula)自身有三处不够用,这里按 dracula 自己调色板里没用到的
+# 颜色改开(注释那条是提亮同色相):
+#
+#   kt(类型)与 nb(内建)都是青  → nb 改用 dracula 的绿 #50FA7B
+#      不分开的话 `int i = blockIdx.x * blockDim.x + threadIdx.x;` 整行同色
+#   k(关键字)与 o(运算符)都是粉 → o 改用 dracula 的紫 #BD93F9
+#      operator 在题库语料里出现 1042 次,仅次于变量名
+#   c(注释)对 --code-bg 只有 3.9:1 → 提亮成 #828FC2,到 5.8:1
+#      **这条是本项目特有的**:题面和参考解的内容基本都在注释里,
+#      注释读着累等于整个工具读着累。dracula 原色是给代码配的,不是给讲义配的。
+#
+# 扫过 7 个现成的深色主题(monokai / native / one-dark / dracula / material /
+# gruvbox-dark / solarized-dark),**没有一个四类 token 两两可辨** —— 见
+# docs/webui.md 的对照表。所以与其换来换去,不如就用最接近的再改几个值。
+#
+# ⚠️ 这几个色值是照 dracula 的调色板挑的,换主题时要一起换。
+_DARK_OVERRIDES = {"nb": "#50FA7B", "o": "#BD93F9", "c": "#828FC2"}
 
 
 # --------------------------------------------------------------------------- #
@@ -787,8 +879,7 @@ def serve(root: Path, leet_bin: Path, host: str = "127.0.0.1", port: int = 8765,
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
 
-    srv = ThreadingHTTPServer((host, port), Handler)
-    srv.daemon_threads = True
+    srv = _Server((host, port), Handler)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
